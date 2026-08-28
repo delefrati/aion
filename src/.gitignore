@@ -4,6 +4,7 @@ __pycache__/
 data/
 !llm_lab/data/
 !llm_lab/data/**
+llm_lab/data/__pycache__/
 *.db
 node_modules/
 dist/
