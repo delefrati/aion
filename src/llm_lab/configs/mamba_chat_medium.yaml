@@ -1,0 +1,38 @@
+# Mamba chat medium — 105M param conversational model
+# Target: Colab T4 (~16GB VRAM)
+# ~3.6x bigger than the 28M model (d_model 512→768, layers 12→24)
+model_type: mamba
+vocab_size: 16384
+d_model: 768
+n_layers: 24
+d_state: 32
+d_conv: 4
+expand: 2
+seq_len: 1024
+seq_curriculum: "256:2000,512:5000,1024:20000"
+
+dataset_type: chat
+instruction_data: ""
+train_path: ""
+val_path: ""
+tokenizer_path: ""
+
+batch_size: 4
+grad_accum_steps: 4    # effective batch = 16
+num_workers: 0
+lr: 1.5e-4
+weight_decay: 0.01
+max_steps: 20000
+warmup_steps: 500
+grad_clip: 1.0
+grad_checkpoint: true  # saves ~40% VRAM at cost of ~20% speed
+compile: false
+seed: 42
+
+checkpoint_dir: checkpoints/mamba_chat_medium
+checkpoint_every: 500
+eval_every: 500
+log_every: 50
+max_eval_batches: 20
+early_stop_patience: 10
+early_stop_min_delta: 0.01

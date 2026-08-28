@@ -1,0 +1,34 @@
+# Mamba proper training — 47M params, GTX 1650 (3.6GB VRAM)
+# fp16 h_states + 8-bit AdamW + allocator tuning
+# batch=2 safe across all curriculum stages (seq=1024 uses 2.71GB)
+# Effective batch = 2 * 8 = 16
+# Curriculum: 256→512→1024 seq_len ramp
+model_type: mamba
+vocab_size: 4096
+d_model: 768
+n_layers: 12
+d_state: 16
+d_conv: 4
+expand: 2
+seq_len: 1024
+
+batch_size: 2
+grad_accum_steps: 8
+grad_checkpoint: true
+seq_curriculum: "256:1000,512:2000,1024:3000"
+lr: 3.0e-4
+weight_decay: 0.01
+max_steps: 3000
+warmup_steps: 150
+grad_clip: 1.0
+seed: 42
+
+checkpoint_dir: /app/data/checkpoints/mamba_medium
+checkpoint_every: 250
+eval_every: 250
+log_every: 50
+max_eval_batches: 20
+
+train_path: /app/data/splits/train.txt
+val_path: /app/data/splits/val.txt
+tokenizer_path: /app/data/tokenizer.json

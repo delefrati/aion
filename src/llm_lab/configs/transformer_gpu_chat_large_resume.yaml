@@ -1,0 +1,40 @@
+# Transformer GPU chat LARGE — resume config for subsequent sessions.
+# Lower LR, short warmup, reset optimizer. Dims must match transformer_gpu_chat_large.
+model_type: transformer
+vocab_size: 16384
+d_model: 1024
+n_layers: 16
+n_heads: 16
+seq_len: 1024
+dropout: 0.1
+tie_embeddings: false  # match transformer_gpu_chat_large / the untied 235M base checkpoint
+
+dataset_type: chat
+instruction_data: ""
+train_path: ""
+val_path: ""
+tokenizer_path: ""
+
+batch_size: 2
+grad_accum_steps: 16
+num_workers: 0
+gpus: 1
+foreach_optim: false
+use_8bit_optim: false
+lr: 3.0e-5
+weight_decay: 0.05
+max_steps: 5000
+warmup_steps: 100
+reset_optimizer: true
+grad_clip: 1.0
+grad_checkpoint: true
+compile: false
+seed: 42
+
+checkpoint_dir: checkpoints/transformer_gpu_chat_large
+checkpoint_every: 500
+eval_every: 250
+log_every: 50
+max_eval_batches: 20
+early_stop_patience: 3
+early_stop_min_delta: 0.01

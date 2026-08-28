@@ -1,0 +1,29 @@
+# Mamba small — ~4M params, 1000 steps, seq_len=256
+# In-between smoke (~738K, 500 steps) and medium (47M, 3000 steps)
+# Expected runtime on GTX 1650: ~10-15 min
+model_type: mamba
+vocab_size: 4096
+d_model: 256
+n_layers: 4
+d_state: 16
+d_conv: 4
+expand: 2
+seq_len: 256
+
+batch_size: 8
+lr: 4.0e-4
+weight_decay: 0.01
+max_steps: 1000
+warmup_steps: 100
+grad_clip: 1.0
+seed: 42
+
+checkpoint_dir: /app/data/checkpoints/mamba_small
+checkpoint_every: 500
+eval_every: 200
+log_every: 50
+max_eval_batches: 10
+
+train_path: /app/data/splits/train.txt
+val_path: /app/data/splits/val.txt
+tokenizer_path: /app/data/tokenizer.json

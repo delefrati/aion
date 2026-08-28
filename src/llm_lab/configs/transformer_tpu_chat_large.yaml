@@ -1,0 +1,39 @@
+# Transformer TPU chat — LARGE (~235M) conversational model on Kaggle TPU v5e-8.
+# Fine-tune on chat data using pretrained weights from transformer_tpu_large.
+# Dims MUST match the base (d_model=1024, n_layers=16, n_heads=16) so the checkpoint loads.
+model_type: transformer
+vocab_size: 16384
+d_model: 1024
+n_layers: 16
+n_heads: 16
+seq_len: 1024
+tie_embeddings: false  # the large pretrain checkpoint is UNTIED (235M); build untied so lm_head loads (torch_xla also unties on TPU)
+
+dataset_type: chat
+instruction_data: ""
+train_path: ""
+val_path: ""
+tokenizer_path: ""
+
+# 235M is ~2x the medium; halve per-core batch and add 2x accumulation to hold the same
+# effective batch (16 * 2 * 8 cores = 256) within each core's 16GB HBM.
+batch_size: 16
+grad_accum_steps: 2
+num_workers: 4
+lr: 1.0e-4          # slightly below the 110M chat LR (1.5e-4) for the bigger model
+weight_decay: 0.05
+max_steps: 20000
+warmup_steps: 500
+grad_clip: 1.0
+grad_checkpoint: true  # recompute attention in backward — bounds HBM to ~1 layer
+compile: false
+tpu_cores: 0  # 0 = all TPU cores (data-parallel); needs a TPU-clean kernel (Cell 1 must not init XLA)
+seed: 42
+
+checkpoint_dir: checkpoints/transformer_tpu_chat_large
+checkpoint_every: 500
+eval_every: 250
+log_every: 50
+max_eval_batches: 20
+early_stop_patience: 3
+early_stop_min_delta: 0.01

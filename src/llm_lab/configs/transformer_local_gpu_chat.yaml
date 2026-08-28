@@ -1,0 +1,46 @@
+# Transformer local GPU chat — same 105M architecture as transformer_tpu_chat,
+# but tuned to fit a 4GB laptop GPU (e.g. GTX 1650, Turing, no usable tensor cores).
+#
+# Architecture is IDENTICAL to transformer_tpu_chat so the same checkpoints load.
+# Only the memory/throughput knobs differ (micro-batch, seq_len, grad accumulation).
+#
+# Run (auto-selects CUDA when torch_xla is absent):
+#   python3 -m llm_lab.cli train \
+#     --config llm_lab/configs/transformer_local_gpu_chat.yaml \
+#     --pretrain-checkpoint ../training-data/aion-transformer-tpu-chat/best.pt \
+#     [set instruction_data / tokenizer_path below or via flags]
+#
+# Timing note: on a GTX 1650 expect ~15-25 s/step at effective batch 32.
+# Lower seq_len to 256 or n_layers to speed up a smoke run.
+model_type: transformer
+vocab_size: 16384
+d_model: 768
+n_layers: 12
+n_heads: 12
+seq_len: 512            # halved from 1024 (TPU) to cut activation memory on 4GB
+
+dataset_type: chat
+instruction_data: ""    # set at runtime, e.g. ../training-data/.../chat_merged.json
+train_path: ""
+val_path: ""
+tokenizer_path: ""      # set at runtime, e.g. ../training-data/.../tokenizer.json
+
+batch_size: 2           # micro-batch that fits 4GB with grad checkpointing
+grad_accum_steps: 16    # effective batch = 32 (matches transformer_tpu_chat)
+num_workers: 2
+lr: 1.5e-4
+weight_decay: 0.05
+max_steps: 5000
+warmup_steps: 100
+grad_clip: 1.0
+grad_checkpoint: true   # recompute activations in backward — required to fit 4GB
+compile: false          # GTX 1650 (Turing) can try compile: true for a small speedup
+seed: 42
+
+checkpoint_dir: checkpoints/transformer_local_gpu_chat
+checkpoint_every: 500
+eval_every: 250
+log_every: 50
+max_eval_batches: 20
+early_stop_patience: 3
+early_stop_min_delta: 0.01

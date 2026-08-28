@@ -1,0 +1,41 @@
+# Continue pretraining the transformer base past step 20,000 (single-core TPU).
+# Warm restart: resumes the base, keeps Adam momentum, and revives the cosine LR over a
+# new 20k->40k horizon so there's a productive learning rate again. Single-core avoids the
+# multi-core xmp.spawn OOM/BrokenProcessPool we hit on the shared-host TPUs.
+model_type: transformer
+vocab_size: 16384
+d_model: 768
+n_layers: 12
+n_heads: 12
+seq_len: 1024
+dropout: 0.1
+
+dataset_type: text
+train_path: ""
+val_path: ""
+tokenizer_path: ""
+instruction_data: ""
+
+# Single core with 8x gradient accumulation keeps the effective batch at 64.
+batch_size: 8
+grad_accum_steps: 8
+tpu_cores: 1
+num_workers: 4
+lr: 1.5e-4
+weight_decay: 0.01
+max_steps: 40000
+warmup_steps: 200
+lr_decay_steps: 40000  # cosine over the full 40k target, not the per-session max_steps
+reset_optimizer: false  # keep optimizer momentum for a smooth warm restart
+grad_clip: 1.0
+grad_checkpoint: true
+compile: false
+seed: 42
+
+checkpoint_dir: checkpoints/transformer_tpu_medium
+checkpoint_every: 500
+eval_every: 500
+log_every: 50
+max_eval_batches: 20
+early_stop_patience: 20
+early_stop_min_delta: 0.01

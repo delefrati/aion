@@ -1,0 +1,38 @@
+# Mamba medium pretrain — resume config
+# Lower lr for continued pretraining after first session
+model_type: mamba
+vocab_size: 16384
+d_model: 768
+n_layers: 24
+d_state: 32
+d_conv: 4
+expand: 2
+seq_len: 1024
+seq_curriculum: "256:2000,512:5000,1024:20000"
+
+dataset_type: text
+train_path: ""
+val_path: ""
+tokenizer_path: ""
+instruction_data: ""
+
+batch_size: 4
+grad_accum_steps: 4
+num_workers: 0
+lr: 1.0e-4
+weight_decay: 0.01
+max_steps: 5000
+warmup_steps: 100
+reset_optimizer: true
+grad_clip: 1.0
+grad_checkpoint: true
+compile: false
+seed: 42
+
+checkpoint_dir: checkpoints/mamba_pretrain_medium
+checkpoint_every: 250
+eval_every: 100
+log_every: 50
+max_eval_batches: 20
+early_stop_patience: 25
+early_stop_min_delta: 0.01

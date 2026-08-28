@@ -1,0 +1,28 @@
+# Virtualenvs (huge — never belong in an image)
+**/.venv
+**/venv
+**/env
+
+# Python caches / build artifacts
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.egg-info
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+
+# Node / frontend build artifacts (frontend builds in its own stage)
+**/node_modules
+frontend/dist
+
+# Notebooks & training/docs not needed at serving time
+**/*.ipynb
+llm_lab/Dockerfile
+llm_lab/Dockerfile.gpu
+llm_lab/COLAB_TRAINING.md
+
+# VCS / editor / OS
+.git
+**/.gitignore
+**/.DS_Store

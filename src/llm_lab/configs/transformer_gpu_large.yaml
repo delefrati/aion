@@ -1,0 +1,44 @@
+# Transformer Large (350M) — Kaggle T4 GPU resume config
+# Same architecture as transformer_tpu_large, adapted for 16GB T4 VRAM.
+# batch_size 2 + grad_accum 32 = eff batch 64 (same as TPU run).
+model_type: transformer
+d_model: 1024
+n_layers: 16
+n_heads: 16
+vocab_size: 16384
+seq_len: 1024
+dropout: 0.1
+
+batch_size: 2
+grad_accum_steps: 32
+grad_checkpoint: true
+grad_clip: 1.0
+compile: false
+
+lr: 0.00025
+warmup_steps: 0
+lr_decay_steps: 50000
+weight_decay: 0.01
+use_8bit_optim: false  # TPU checkpoint used standard AdamW; match it so optimizer state resumes cleanly
+tie_embeddings: false  # torch_xla broke the lm_head/embedding tie on TPU, so the checkpoint is UNTIED (235M); build untied here to match
+gpus: 1                # single GPU. 2x T4 DDP OOM-kills Kaggle's ~13GB host on a 235M resume
+                       # (each rank loads the 2.8GB ckpt). Set gpus: 0 to try all GPUs anyway.
+
+max_steps: 50000
+eval_every: 500
+checkpoint_every: 500
+log_every: 50
+max_eval_batches: 20
+early_stop_patience: 20
+early_stop_min_delta: 0.01
+
+num_workers: 0         # in-process data loading — fewer host procs (memmap needs no copy)
+foreach_optim: false   # avoid the foreach-AdamW transient spike that OOMs the T4 at step 1
+seed: 42
+
+dataset_type: text
+train_path: /tmp/data/train.txt
+val_path: /tmp/data/val.txt
+tokenizer_path: /tmp/data/tokenizer.json
+instruction_data: ''
+checkpoint_dir: /tmp/checkpoints

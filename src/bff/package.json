@@ -1,0 +1,21 @@
+{
+  "name": "aion-bff",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "fastify": "^5.0",
+    "@fastify/cors": "^10.0",
+    "zod": "^3.23"
+  },
+  "devDependencies": {
+    "typescript": "^5.5",
+    "tsx": "^4.16",
+    "@types/node": "^22"
+  }
+}

@@ -1,0 +1,38 @@
+# Mamba medium pretrain — 105M param language model on text corpus
+# Target: Colab T4 (~16GB VRAM)
+# Phase 1 of 2: pretrain on Wikipedia + SlimPajama, then fine-tune on chat
+model_type: mamba
+vocab_size: 16384
+d_model: 768
+n_layers: 24
+d_state: 32
+d_conv: 4
+expand: 2
+seq_len: 1024
+seq_curriculum: "256:2000,512:5000,1024:20000"
+
+dataset_type: text
+train_path: ""     # set at runtime
+val_path: ""       # set at runtime
+tokenizer_path: ""
+instruction_data: ""
+
+batch_size: 4
+grad_accum_steps: 4    # effective batch = 16
+num_workers: 0
+lr: 3.0e-4
+weight_decay: 0.01
+max_steps: 20000
+warmup_steps: 1000
+grad_clip: 1.0
+grad_checkpoint: true
+compile: false
+seed: 42
+
+checkpoint_dir: checkpoints/mamba_pretrain_medium
+checkpoint_every: 100
+eval_every: 100
+log_every: 50
+max_eval_batches: 20
+early_stop_patience: 25
+early_stop_min_delta: 0.01

@@ -1,0 +1,35 @@
+# Transformer TPU chat — 105M param conversational model on Kaggle TPU v5e-8
+# Fine-tune on chat data using pretrained weights from transformer_tpu_medium.
+model_type: transformer
+vocab_size: 16384
+d_model: 768
+n_layers: 12
+n_heads: 12
+seq_len: 1024
+
+dataset_type: chat
+instruction_data: ""
+train_path: ""
+val_path: ""
+tokenizer_path: ""
+
+batch_size: 32
+grad_accum_steps: 1
+num_workers: 4
+lr: 1.5e-4
+weight_decay: 0.05
+max_steps: 20000
+warmup_steps: 500
+grad_clip: 1.0
+grad_checkpoint: true  # recompute attention in backward — bounds HBM to ~1 layer
+compile: false
+tpu_cores: 0  # 0 = all TPU cores (data-parallel); needs a TPU-clean kernel (Cell 1 must not init XLA)
+seed: 42
+
+checkpoint_dir: checkpoints/transformer_tpu_chat
+checkpoint_every: 500
+eval_every: 250
+log_every: 50
+max_eval_batches: 20
+early_stop_patience: 3
+early_stop_min_delta: 0.01

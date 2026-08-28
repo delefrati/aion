@@ -1,0 +1,38 @@
+# Transformer TPU medium pretrain — resume config for subsequent sessions
+# Lower LR, short warmup, reset optimizer.
+model_type: transformer
+vocab_size: 16384
+d_model: 768
+n_layers: 12
+n_heads: 12
+seq_len: 1024
+dropout: 0.1
+
+dataset_type: text
+train_path: ""
+val_path: ""
+tokenizer_path: ""
+instruction_data: ""
+
+batch_size: 8
+grad_accum_steps: 1
+tpu_cores: 8
+num_workers: 4
+lr: 1.0e-4
+weight_decay: 0.01
+max_steps: 5000
+warmup_steps: 100
+lr_decay_steps: 20000  # cosine decays over the full target, not per-session max_steps
+reset_optimizer: true
+grad_clip: 1.0
+grad_checkpoint: true  # recompute attention in backward — bounds HBM to ~1 layer
+compile: false
+seed: 42
+
+checkpoint_dir: checkpoints/transformer_tpu_medium
+checkpoint_every: 500
+eval_every: 500
+log_every: 50
+max_eval_batches: 20
+early_stop_patience: 20
+early_stop_min_delta: 0.01

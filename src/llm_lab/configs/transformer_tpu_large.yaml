@@ -1,0 +1,47 @@
+# Transformer LARGE for TPU v5e-8 (Kaggle) — ~235M params, the capacity bump above the
+# 110M medium base. d_model 768->1024, layers 12->16 (params = 2*vocab*d + 12*L*d^2).
+# Single-core (tpu_cores=1) + 8x grad accumulation keeps effective batch 64 and avoids the
+# multi-core xmp.spawn BrokenProcessPool we hit on shared-host Kaggle TPUs. grad_checkpoint
+# is REQUIRED at this size (XLA has no flash-attention; scores are materialized per layer).
+# One config end-to-end: lr_decay_steps spans the full 50k target, so no warm-restart
+# variant is needed — the notebook just overrides max_steps per session.
+model_type: transformer
+vocab_size: 16384
+d_model: 1024
+n_layers: 16
+n_heads: 16
+seq_len: 1024
+dropout: 0.1
+
+dataset_type: text
+train_path: ""
+val_path: ""
+tokenizer_path: ""
+instruction_data: ""
+
+# Single-core, eff batch 4*16 = 64. Multi-core (tpu_cores=0) DOES now engage (x8) after the
+# tpu_cores config-field fix, but the 235M model crashes with BrokenProcessPool during the
+# first-step compile — 8 workers compiling the full fwd+bwd+optimizer graph at once exhausts
+# the Kaggle host. Single-core fits HBM because the trainer flushes the XLA graph per micro-
+# step (peak HBM ~batch, not batch*accum). ~4h per 5k-step session.
+batch_size: 4
+grad_accum_steps: 16
+tpu_cores: 1
+num_workers: 4
+lr: 2.5e-4          # slightly below the 110M peak (3e-4) — bigger model, gentler LR
+weight_decay: 0.01
+max_steps: 50000    # ~3.3B tokens processed (65,536/step); ~1.5 epochs over the 8000 preset
+warmup_steps: 1000  # longer warmup helps larger models settle
+lr_decay_steps: 50000  # cosine over the full target, not the per-session max_steps
+grad_clip: 1.0
+grad_checkpoint: true  # essential at 235M — bounds HBM to ~1 layer's attention scores
+compile: false
+seed: 42
+
+checkpoint_dir: checkpoints/transformer_tpu_large
+checkpoint_every: 500
+eval_every: 500
+log_every: 50
+max_eval_batches: 20
+early_stop_patience: 20
+early_stop_min_delta: 0.01

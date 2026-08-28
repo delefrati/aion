@@ -1,0 +1,16 @@
+"""Storage abstraction protocol.
+
+Both SQLite and PostgreSQL implement this interface.
+The backend switches implementation based on AION_MODE.
+"""
+from __future__ import annotations
+
+from typing import Protocol
+
+
+class Store(Protocol):
+    async def init(self) -> None: ...
+    async def close(self) -> None: ...
+    async def save_message(self, conversation_id: str, role: str, content: str) -> None: ...
+    async def get_conversation(self, conversation_id: str) -> list[dict]: ...
+    async def list_conversations(self, limit: int = 50) -> list[dict]: ...

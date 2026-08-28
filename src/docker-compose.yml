@@ -1,0 +1,107 @@
+# AION v3 — docker compose up (Nano mode by default)
+#
+# Nano:     docker compose up
+# Standard: docker compose --profile standard up
+# Lab:      docker compose --profile lab-cpu up
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "8900:8900"
+    env_file: .env
+    volumes:
+      - backend-data:/app/data
+      - ../training-data:/app/lab-data:ro
+      - hf-cache:/app/hf-cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8900/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3900:3900"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  # ── Standard mode additions ──
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aion}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aion}
+      POSTGRES_DB: ${POSTGRES_DB:-aion}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aion}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    profiles:
+      - standard
+
+  bff:
+    build: ./bff
+    ports:
+      - "3901:3901"
+    environment:
+      BACKEND_URL: http://backend:8900
+      BFF_PORT: "3901"
+    depends_on:
+      backend:
+        condition: service_healthy
+    profiles:
+      - standard
+
+  # ── Lab mode additions ──
+
+  lab:
+    build: ./llm_lab
+    env_file: .env
+    volumes:
+      - lab-data:/app/data
+      - ./llm_lab/configs:/app/configs:ro
+    profiles:
+      - lab-cpu
+
+  lab-gpu:
+    build:
+      context: ./llm_lab
+      dockerfile: Dockerfile.gpu
+    env_file: .env
+    volumes:
+      - lab-data:/app/data
+      - ./llm_lab/configs:/app/configs:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles:
+      - lab-gpu
+
+volumes:
+  backend-data:
+  postgres-data:
+  lab-data:
+  hf-cache:

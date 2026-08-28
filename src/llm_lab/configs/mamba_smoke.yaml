@@ -1,0 +1,27 @@
+# Mamba smoke test — small model, short run, CPU-friendly
+model_type: mamba
+vocab_size: 4096
+d_model: 128
+n_layers: 2
+d_state: 8
+d_conv: 4
+expand: 2
+seq_len: 128
+
+batch_size: 8
+lr: 5.0e-4
+weight_decay: 0.01
+max_steps: 500
+warmup_steps: 50
+grad_clip: 1.0
+seed: 42
+
+checkpoint_dir: /app/data/checkpoints/mamba_smoke
+checkpoint_every: 250
+eval_every: 100
+log_every: 25
+max_eval_batches: 10
+
+train_path: /app/data/splits/train.txt
+val_path: /app/data/splits/val.txt
+tokenizer_path: /app/data/tokenizer.json

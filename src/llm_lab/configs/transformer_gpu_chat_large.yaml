@@ -1,0 +1,41 @@
+# Transformer GPU chat — LARGE (~235M) conversational fine-tune on Colab/Kaggle T4 GPU.
+# Fine-tune on chat data from the pretrained transformer_*_large base.
+# Dims MUST match the base (d_model=1024, n_layers=16, n_heads=16) so the checkpoint loads.
+model_type: transformer
+vocab_size: 16384
+d_model: 1024
+n_layers: 16
+n_heads: 16
+seq_len: 1024
+dropout: 0.1
+tie_embeddings: false  # base is UNTIED 235M (torch_xla unties on TPU); build untied so lm_head loads
+
+dataset_type: chat
+instruction_data: ""
+train_path: ""
+val_path: ""
+tokenizer_path: ""
+
+# T4 (16GB): batch 2 x accum 16 = eff batch 32. grad_checkpoint bounds activation memory to ~1 layer.
+batch_size: 2
+grad_accum_steps: 16
+num_workers: 0         # in-process loading; chat data is small (no randperm blow-up)
+gpus: 1                # 1 = single GPU; the notebook sets 0 for 2x T4 DDP
+foreach_optim: false   # avoid the foreach-AdamW transient spike that OOMs the T4
+use_8bit_optim: false
+lr: 1.0e-4             # slightly below the 110M chat LR for the bigger model
+weight_decay: 0.05
+max_steps: 20000
+warmup_steps: 500
+grad_clip: 1.0
+grad_checkpoint: true
+compile: false
+seed: 42
+
+checkpoint_dir: checkpoints/transformer_gpu_chat_large
+checkpoint_every: 500
+eval_every: 250
+log_every: 50
+max_eval_batches: 20
+early_stop_patience: 3
+early_stop_min_delta: 0.01

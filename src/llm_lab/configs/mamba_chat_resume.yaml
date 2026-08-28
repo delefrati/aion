@@ -1,0 +1,41 @@
+# Mamba chat — fine-tune resume from a pre-trained checkpoint
+# Use after a run diverged or peaked early. Load a good checkpoint via
+# prepare_finetune_checkpoint.py, then point checkpoint_dir here.
+#
+# Key differences from mamba_chat.yaml:
+#   - lr: 5e-5 (4x lower — warm start, model already trained)
+#   - max_steps: 3000 (short run, cosine decays fully in this range)
+#   - warmup_steps: 100 (short warmup)
+#   - checkpoint_dir: mamba_chat_finetune (separate from original run)
+model_type: mamba
+vocab_size: 16384
+d_model: 512
+n_layers: 12
+d_state: 32
+d_conv: 4
+expand: 2
+seq_len: 1024
+
+dataset_type: chat
+instruction_data: ""   # set at runtime e.g. /content/data/chat_merged.json
+train_path: ""
+val_path: ""
+tokenizer_path: ""
+
+batch_size: 8
+grad_accum_steps: 4
+num_workers: 0
+lr: 5.0e-5              # 4x lower than original — model already pre-trained
+weight_decay: 0.01
+max_steps: 5000         # ~3h per session on T4 with 50M param model
+warmup_steps: 100
+reset_optimizer: true   # discard old lr schedule, start fresh at lr=5e-5
+grad_clip: 1.0
+compile: false
+seed: 42
+
+checkpoint_dir: checkpoints/mamba_chat_finetune
+checkpoint_every: 250
+eval_every: 250
+log_every: 50
+max_eval_batches: 20

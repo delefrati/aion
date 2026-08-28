@@ -1,0 +1,29 @@
+services:
+  backend:
+    build: ../backend
+    ports:
+      - "8900:8900"
+    env_file: .env
+    volumes:
+      - backend-data:/app/data
+    profiles: ["default", "standard", "lab"]
+
+  bff:
+    build: ../bff
+    ports:
+      - "3901:3901"
+    env_file: .env
+    depends_on:
+      - backend
+    profiles: ["standard"]
+
+  frontend:
+    build: ../frontend
+    ports:
+      - "3900:3900"
+    depends_on:
+      - backend
+    profiles: ["default", "standard"]
+
+volumes:
+  backend-data:

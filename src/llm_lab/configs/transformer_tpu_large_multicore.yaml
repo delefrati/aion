@@ -1,0 +1,42 @@
+# Transformer LARGE, MULTI-CORE attempt for TPU v5e-8 (Kaggle) — ~235M params, 8x throughput.
+# Same model as transformer_tpu_large.yaml but data-parallel across all 8 cores.
+#
+# The 235M multi-core run crashes with BrokenProcessPool during the FIRST-STEP compile: all
+# 8 replicas compile the full fwd+bwd+optimizer+all-reduce graph on the shared Kaggle host at
+# once and the RAM spike kills a worker. This config attacks that spike from every angle:
+#   - batch 2 (not 4): smaller per-core activation footprint -> smaller HLO -> less compile RAM
+#   - num_workers 0: no dataloader subprocesses stealing host RAM during compile (also enforced
+#     in code for any multi-core run)
+#   - persistent XLA compile cache (checkpoint_dir/xla_cache, automatic): the first run compiles,
+#     every resume after loads the executable from disk and skips the spike entirely
+# Effective batch = 2 * 4 * 8 = 64, identical to the single-core config.
+#
+# If this STILL BrokenProcessPools on the first step, the host genuinely can't hold 8 parallel
+# 235M compiles — fall back to transformer_tpu_large.yaml (single-core, eff 64, ~4h/session).
+model_type: transformer
+vocab_size: 16384
+d_model: 1024
+n_layers: 16
+n_heads: 16
+seq_len: 1024
+dropout: 0.1
+
+dataset_type: text
+train_path: ""
+val_path: ""
+tokenizer_path: ""
+instruction_data: ""
+
+batch_size: 2          # small per-core batch shrinks the first-step compile footprint
+grad_accum_steps: 4    # 2 * 4 * 8 cores = effective batch 64 (matches single-core)
+tpu_cores: 0           # 0 = fan out to every TPU core (data-parallel)
+num_workers: 0         # keep host RAM for the compiler (also force-set in code for multi-core)
+lr: 2.5e-4
+weight_decay: 0.01
+max_steps: 50000
+warmup_steps: 1000
+lr_decay_steps: 50000
+grad_clip: 1.0
+grad_checkpoint: true
+compile: false
+seed: 42

@@ -1,0 +1,43 @@
+# Mamba chat medium — resume config for 105M model
+# Use after the first session to continue training with fresh optimizer.
+#
+# Key differences from mamba_chat_medium.yaml:
+#   - lr: 5e-5 (3x lower — model already partially trained)
+#   - warmup_steps: 100 (short warmup)
+#   - reset_optimizer: true (discard stale lr schedule from previous session)
+#   - no seq_curriculum (stays at seq_len=1024)
+model_type: mamba
+vocab_size: 16384
+d_model: 768
+n_layers: 24
+d_state: 32
+d_conv: 4
+expand: 2
+seq_len: 1024
+
+dataset_type: chat
+instruction_data: ""
+train_path: ""
+val_path: ""
+tokenizer_path: ""
+
+batch_size: 4
+grad_accum_steps: 4    # effective batch = 16
+num_workers: 0
+lr: 5.0e-5
+weight_decay: 0.01
+max_steps: 5000
+warmup_steps: 100
+reset_optimizer: true
+grad_clip: 1.0
+grad_checkpoint: true
+compile: false
+seed: 42
+
+checkpoint_dir: checkpoints/mamba_chat_medium
+checkpoint_every: 500
+eval_every: 500
+log_every: 50
+max_eval_batches: 20
+early_stop_patience: 10
+early_stop_min_delta: 0.01

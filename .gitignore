@@ -1,0 +1,28 @@
+
+# Training artifacts
+training-data/
+*.pt
+*.bin
+*.safetensors
+
+# Runtime data
+data/*.db
+*.db
+
+# Environment & secrets
+.env
+kaggle.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+
+# IDE
+.vscode/
+kaggle.json
