@@ -12,6 +12,7 @@ n_layers: 16
 n_heads: 16
 seq_len: 1024
 dropout: 0.1
+tie_embeddings: false  # torch_xla physically unties on TPU; declare it so GPU-side resume/generate loads the separate lm_head instead of collapsing it onto the embedding
 
 dataset_type: text
 train_path: ""
