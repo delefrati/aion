@@ -19,13 +19,15 @@ val_path: ""
 tokenizer_path: ""
 instruction_data: ""
 
-# Single-core, eff batch 4*16 = 64. Multi-core (tpu_cores=0) DOES now engage (x8) after the
+# Single-core, eff batch 2*32 = 64. Multi-core (tpu_cores=0) DOES now engage (x8) after the
 # tpu_cores config-field fix, but the 235M model crashes with BrokenProcessPool during the
 # first-step compile — 8 workers compiling the full fwd+bwd+optimizer graph at once exhausts
 # the Kaggle host. Single-core fits HBM because the trainer flushes the XLA graph per micro-
-# step (peak HBM ~batch, not batch*accum). ~4h per 5k-step session.
-batch_size: 4
-grad_accum_steps: 16
+# step (peak HBM ~batch, not batch*accum). batch_size 2 (not 4): at 4 the compiled step
+# program reserves ~12.7G and OOMs the v5e core (only ~12G free after resident weights +
+# Adam states); 2 halves the backward peak. ~4h per 5k-step session.
+batch_size: 2
+grad_accum_steps: 32
 tpu_cores: 1
 num_workers: 4
 lr: 2.5e-4          # slightly below the 110M peak (3e-4) — bigger model, gentler LR
