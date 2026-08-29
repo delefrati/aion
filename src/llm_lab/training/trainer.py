@@ -426,6 +426,10 @@ def train(cfg: TrainConfig) -> dict:
 
                     if is_tpu:
                         loss.backward()
+                        # Flush each micro-step so the lazy XLA graph spans ONE microbatch,
+                        # not all accum_steps — grads persist in .grad across mark_step, so
+                        # peak HBM stays ~batch (not batch*accum, which OOMs at 235M).
+                        xm.mark_step()
                     else:
                         scaler.scale(loss).backward()
 
