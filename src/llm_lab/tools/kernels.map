@@ -1,0 +1,13 @@
+# Kaggle kernel mapping: <notebook.ipynb>  <owner/kernel-slug>
+# Whitespace-separated. Lines starting with # are ignored.
+#
+# Find your exact slugs with:   kaggle kernels list --mine
+# A wrong/blank slug would CREATE a new kernel on push, so verify before syncing.
+# Replace every REPLACE-ME below with the real owner/slug.
+
+kaggle_chat_gpu_large.ipynb            delefrati/kaggle-chat-gpu-large
+kaggle_pretrain_gpu_large.ipynb        delefrati/REPLACE-ME
+kaggle_pretrain_tpu.ipynb              delefrati/tpu-chat-pretrain-large
+kaggle_pretrain_medium.ipynb           delefrati/REPLACE-ME
+kaggle_chat_multisession_medium.ipynb  delefrati/REPLACE-ME
+kaggle_chat_tpu.ipynb                  delefrati/REPLACE-ME
