@@ -9,8 +9,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-OWNER_REPO="delefrati/aion"
-BRANCH="main"
+# Owner/repo + branch come from the git remote — nothing hardcoded in the repo.
+OWNER_REPO="$(git remote get-url origin | sed -E 's#^(git@[^:]+:|https?://[^/]+/)##; s#\.git$##')"
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 NB_DIR_REL="src/llm_lab"
 NB_DIR="$(cd .. && pwd)"
 
