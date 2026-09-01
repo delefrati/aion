@@ -470,6 +470,11 @@ PRESETS = {
     # the 40k-step continue budget (~2.6B tokens processed). Raising further only helps if
     # max_steps also goes past 40k, else the model won't see all the extra tokens.
     "pretrain": {"wikipedia_mb": 1000, "slimpajama_mb": 8000, "dolly": False, "no_robots": False, "guanaco": False, "hh_rlhf": False},
+    # ~2000+18000 MB ≈ ~5B unique tokens — Chinchilla-optimal for the 235M base (~20 tok/param).
+    # Use with the 235M run: removes the repetition the 8000 preset hits at 50k steps, and lets
+    # you extend past 50k without re-seeing data. Fold it in via the notebook's ADD_DATA path so
+    # val.bin + tokenizer stay frozen (losses stay comparable to the current run).
+    "pretrain_xl": {"wikipedia_mb": 2000, "slimpajama_mb": 18000, "dolly": False, "no_robots": False, "guanaco": False, "hh_rlhf": False},
 }
 
 

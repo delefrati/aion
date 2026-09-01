@@ -1,0 +1,51 @@
+# Transformer XL (~350M) — fresh GPU pretrain that fits a 16GB T4 WITHOUT OOM.
+# d_model 1024->1152, layers 16->20, heads 16->18 (head_dim 64). ~350M params.
+# This is a FROM-SCRATCH model (new shapes) — it cannot resume the 235M checkpoint.
+#
+# How it avoids OOM at a bigger size (vs the 235M config):
+#   use_8bit_optim: true  -> bitsandbytes AdamW8bit, ~2/3 less optimizer state (GPU only)
+#   batch_size: 1         -> half the activation peak of batch 2
+#   grad_accum_steps: 64  -> keeps effective batch 64
+#   grad_checkpoint: true -> activations recomputed, bounds memory to ~1 layer
+#   seq_len 1024          -> drop to 512 if you still OOM (halves activations again)
+# NOTE: bitsandbytes needs CUDA — this config is GPU-only (TPU/XLA can't use 8-bit).
+model_type: transformer
+d_model: 1152
+n_layers: 20
+n_heads: 18
+vocab_size: 16384
+seq_len: 1024
+dropout: 0.1
+
+batch_size: 1
+grad_accum_steps: 64
+grad_checkpoint: true
+grad_clip: 1.0
+compile: false
+
+lr: 0.0002
+warmup_steps: 1000
+lr_decay_steps: 100000
+weight_decay: 0.01
+use_8bit_optim: true    # fresh run — no TPU optimizer state to match, so 8-bit is free memory savings
+tie_embeddings: true    # fresh GPU model (no torch_xla to break the tie) — saves params + memory
+foreach_optim: false
+gpus: 1                 # set 0 to shard across 2x T4 via DDP if the host RAM allows
+
+max_steps: 100000       # ~350M is Chinchilla-optimal near ~7B tokens (~107k steps at eff batch 64)
+eval_every: 500
+checkpoint_every: 500
+log_every: 50
+max_eval_batches: 20
+early_stop_patience: 20
+early_stop_min_delta: 0.01
+
+num_workers: 0
+seed: 42
+
+dataset_type: text
+train_path: /tmp/data/train.txt
+val_path: /tmp/data/val.txt
+tokenizer_path: /tmp/data/tokenizer.json
+instruction_data: ''
+checkpoint_dir: /tmp/checkpoints
