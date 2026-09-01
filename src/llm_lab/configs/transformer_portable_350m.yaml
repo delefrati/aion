@@ -1,0 +1,56 @@
+# Transformer Portable 350M — one config that trains on BOTH single-core TPU (v5e, 16GB)
+# and T4 GPU (15GB), so a checkpoint moves freely across TPU/GPU + Kaggle/Colab.
+# d_model 1152 / 20 layers / 18 heads (head_dim 64), UNTIED => ~356M params.
+#
+# Portability invariants (do NOT change these per-device, or checkpoints stop moving):
+#   tie_embeddings: false   -> torch_xla unties on .to(xla); tied ckpts load as garbage on
+#                              the other device. Untied everywhere = identical layout both sides.
+#   use_8bit_optim: false   -> standard fp32 AdamW on both. 8-bit is CUDA-only and would reset
+#                              optimizer moments on every TPU<->GPU switch.
+#   vocab_size / seq_len / tokenizer -> fixed for the whole lineage.
+# Memory fit (batch 1 + grad_checkpoint): fp32 AdamW ~16 B/param ~= 5.6GB static, ~7GB with
+# runtime -> fits both at seq_len 1024. Drop seq_len to 512 only if a device OOMs.
+model_type: transformer
+d_model: 1152
+n_layers: 20
+n_heads: 18
+vocab_size: 16384
+seq_len: 1024
+dropout: 0.1
+tie_embeddings: false
+
+batch_size: 1
+grad_accum_steps: 64      # eff batch 64 (single worker); on 2xT4 DDP use gpus:0 + accum 32
+grad_checkpoint: true
+grad_clip: 1.0
+compile: false
+
+lr: 0.0002
+warmup_steps: 2000
+lr_decay_steps: 150000    # ~10B tokens at eff batch 64; over-train past Chinchilla (7B)
+weight_decay: 0.01
+use_8bit_optim: false
+foreach_optim: false      # avoid the foreach-AdamW transient spike that OOMs at step 1
+reset_optimizer: false
+
+# Device selection — the notebook sets the one for its platform; the other is ignored.
+tpu_cores: 1              # single-core only (multi-core xmp.spawn crashes at this size)
+gpus: 1                   # set 0 for 2xT4 DDP (then halve grad_accum_steps to keep eff batch)
+
+max_steps: 150000
+eval_every: 500
+checkpoint_every: 500
+log_every: 50
+max_eval_batches: 20
+early_stop_patience: 40   # over-training on purpose — high patience
+early_stop_min_delta: 0.01
+
+num_workers: 0
+seed: 42
+
+dataset_type: text
+train_path: /tmp/data/train.txt
+val_path: /tmp/data/val.txt
+tokenizer_path: /tmp/data/tokenizer.json
+instruction_data: ''
+checkpoint_dir: /tmp/checkpoints
