@@ -17,14 +17,14 @@ compile: false
 
 lr: 0.00025
 warmup_steps: 0
-lr_decay_steps: 50000
+lr_decay_steps: 72000   # extended to compute-optimal (~4.7B tokens); anneals over the full 72k, not 50k
 weight_decay: 0.01
 use_8bit_optim: false  # TPU checkpoint used standard AdamW; match it so optimizer state resumes cleanly
 tie_embeddings: false  # torch_xla broke the lm_head/embedding tie on TPU, so the checkpoint is UNTIED (235M); build untied here to match
 gpus: 1                # single GPU. 2x T4 DDP OOM-kills Kaggle's ~13GB host on a 235M resume
                        # (each rank loads the 2.8GB ckpt). Set gpus: 0 to try all GPUs anyway.
 
-max_steps: 50000
+max_steps: 72000
 eval_every: 500
 checkpoint_every: 500
 log_every: 50

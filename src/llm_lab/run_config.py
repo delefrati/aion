@@ -9,7 +9,7 @@ overfitting overshoot, lives here.
 
 # name -> total target steps (the hard cap the notebook stops at)
 BUDGETS = {
-    "pretrain_large": 50000,       # 235M base pretrain (1024/16/16)
+    "pretrain_large": 72000,       # 235M base: compute-optimal ~4.7B tokens (needs pretrain_xl data to avoid repeats)
     "pretrain_medium": 20000,      # 110M base pretrain
     "pretrain_tpu_medium": 40000,  # 110M TPU continue (20k->40k warm restart)
     "chat_large": 8000,            # 235M chat finetune — overfits past ~7.5k, cap at the knee

@@ -33,9 +33,9 @@ tpu_cores: 1
 num_workers: 4
 lr: 2.5e-4          # slightly below the 110M peak (3e-4) — bigger model, gentler LR
 weight_decay: 0.01
-max_steps: 50000    # ~3.3B tokens processed (65,536/step); ~1.5 epochs over the 8000 preset
+max_steps: 72000    # compute-optimal ~4.7B tokens (65,536/step); needs pretrain_xl data so the extra steps don't repeat
 warmup_steps: 1000  # longer warmup helps larger models settle
-lr_decay_steps: 50000  # cosine over the full target, not the per-session max_steps
+lr_decay_steps: 72000  # cosine over the full extended target, not the per-session max_steps
 grad_clip: 1.0
 grad_checkpoint: true  # essential at 235M — bounds HBM to ~1 layer's attention scores
 compile: false
