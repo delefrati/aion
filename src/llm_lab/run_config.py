@@ -23,3 +23,17 @@ def budget(name: str) -> int:
     if name not in BUDGETS:
         raise KeyError(f"Unknown run budget '{name}'. Known: {sorted(BUDGETS)}")
     return BUDGETS[name]
+
+
+# name -> raw-corpus download preset (see data/download.py PRESETS). The 235M base uses the
+# enlarged pretrain_xl (~5B tokens) so its extended 72k-step run sees new data, not repeats.
+DATA_PRESETS = {
+    "pretrain_large": "pretrain_xl",
+    "pretrain_medium": "pretrain",
+    "pretrain_tpu_medium": "pretrain",
+}
+
+
+def data_preset(name: str) -> str:
+    """Raw-corpus preset for a named run; defaults to the standard 'pretrain'."""
+    return DATA_PRESETS.get(name, "pretrain")
