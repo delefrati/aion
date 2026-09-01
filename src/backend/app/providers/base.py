@@ -13,10 +13,10 @@ class BaseProvider:
 
     FALLBACK = "I'm not sure how to respond to that."
 
-    async def generate(self, message: str, history: list[dict]) -> str:
+    async def generate(self, message: str, history: list[dict], params: dict | None = None) -> str:
         raise NotImplementedError
 
-    async def stream(self, message: str, history: list[dict]) -> AsyncIterator[str]:
-        response = await self.generate(message, history)
+    async def stream(self, message: str, history: list[dict], params: dict | None = None) -> AsyncIterator[str]:
+        response = await self.generate(message, history, params)
         for word in response.split(" "):
             yield word + " "

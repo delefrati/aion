@@ -68,9 +68,9 @@ class HFLocalProvider(BaseProvider):
     # Provider contract                                                    #
     # ------------------------------------------------------------------ #
 
-    async def generate(self, message: str, history: list[dict]) -> str:
+    async def generate(self, message: str, history: list[dict], params: dict | None = None) -> str:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._generate_sync, message, history)
+        return await loop.run_in_executor(None, self._generate_sync, message, history, params or {})
 
     # ------------------------------------------------------------------ #
     # Internal helpers                                                     #
@@ -89,15 +89,15 @@ class HFLocalProvider(BaseProvider):
         context = "\n".join(f"{m['role']}: {m['content']}" for m in history[-4:])
         return f"{context}\nuser: {message}\nassistant:"
 
-    def _generate_sync(self, message: str, history: list[dict]) -> str:
+    def _generate_sync(self, message: str, history: list[dict], params: dict) -> str:
         prompt = self._build_prompt(message, history)
 
         result = self._pipe(
             prompt,
-            max_new_tokens=self._max_new_tokens,
+            max_new_tokens=params.get("max_tokens", self._max_new_tokens),
             do_sample=True,
-            temperature=0.7,
-            top_p=0.9,
+            temperature=params.get("temperature", 0.7),
+            top_p=params.get("top_p", 0.9),
             pad_token_id=self._tokenizer.eos_token_id,
             return_full_text=False,
         )

@@ -74,18 +74,20 @@ class LocalMambaProvider(BaseProvider):
 
         raise FileNotFoundError(f"Checkpoint not found: {path}")
 
-    async def generate(self, message: str, history: list[dict]) -> str:
-        prompt = self._format_prompt(message, history)
-        output = self._generate_sync(prompt)
+    async def generate(self, message: str, history: list[dict], params: dict | None = None) -> str:
+        params = params or {}
+        prompt = self._format_prompt(message, history, params.get("history_turns"))
+        output = self._generate_sync(prompt, params)
         return self._extract_response(output)
 
-    def _format_prompt(self, message: str, history: list[dict]) -> str:
+    def _format_prompt(self, message: str, history: list[dict], history_turns: int | None = None) -> str:
         """Format as chat prompt using the multi-turn template.
 
         Trims old turns so the prompt leaves at least half the context window
         for generation.
         """
         max_prompt_tokens = self.context_len // 2
+        turns = self.history_turns if history_turns is None else history_turns
 
         # Current user turn is always included
         suffix = f"<|user|>{message}<|end|>\n<|assistant|>"
@@ -96,7 +98,7 @@ class LocalMambaProvider(BaseProvider):
         # answers, so a long history feeds a self-reinforcing repetition loop.
         kept: list[str] = []
         used = suffix_len
-        for m in reversed(history[-self.history_turns:] if self.history_turns else []):
+        for m in reversed(history[-turns:] if turns else []):
             role_tag = "<|user|>" if m["role"] == "user" else "<|assistant|>"
             turn = f"{role_tag}{m['content']}<|end|>"
             turn_len = len(self.tokenizer.encode(turn).ids)
@@ -110,21 +112,24 @@ class LocalMambaProvider(BaseProvider):
         return "\n".join(kept)
 
     @torch.no_grad()
-    def _generate_sync(self, prompt: str) -> str:
+    def _generate_sync(self, prompt: str, params: dict | None = None) -> str:
         """Run autoregressive generation, reusing the lab's sampler."""
         from llm_lab.eval.metrics import generate
 
+        params = params or {}
         prompt_len = len(self.tokenizer.encode(prompt).ids)
         # Cap generation so prompt + generated stays within the trained context window
-        budget = max(1, min(self.max_tokens, self.context_len - prompt_len))
+        requested_tokens = params.get("max_tokens", self.max_tokens)
+        budget = max(1, min(requested_tokens, self.context_len - prompt_len))
         end_marker = self.tokenizer.encode("<|end|>").ids
         logger.info("Generating: prompt=%d tokens, budget=%d tokens", prompt_len, budget)
         t0 = time.monotonic()
 
         output = generate(
             self.model, self.tokenizer, prompt,
-            max_tokens=budget, temperature=self.temperature,
-            top_k=40, top_p=0.9, repetition_penalty=1.3,
+            max_tokens=budget, temperature=params.get("temperature", self.temperature),
+            top_k=params.get("top_k", 40), top_p=params.get("top_p", 0.9),
+            repetition_penalty=params.get("repetition_penalty", 1.3),
             stop_sequences=[end_marker] if end_marker else None,
         )
         logger.info("Generated in %.1fs", time.monotonic() - t0)

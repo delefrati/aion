@@ -8,7 +8,7 @@ class DeterministicProvider(BaseProvider):
 
     GREETINGS = {"hi", "hello", "hey", "greetings", "good morning", "good afternoon", "good evening"}
 
-    async def generate(self, message: str, history: list[dict]) -> str:
+    async def generate(self, message: str, history: list[dict], params: dict | None = None) -> str:
         return self._respond(message, history)
 
     def _respond(self, message: str, history: list[dict]) -> str:
