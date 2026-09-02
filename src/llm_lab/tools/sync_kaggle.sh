@@ -7,8 +7,12 @@
 #   Fill the kernel short-names in kernels.map  (find them: kaggle kernels list --mine)
 #
 # Usage:
-#   ./sync_kaggle.sh                              # push every mapped kernel
-#   ./sync_kaggle.sh kaggle_chat_gpu_large.ipynb # push just one
+#   ./sync_kaggle.sh                                  # DRY-RUN: list what would push
+#   ./sync_kaggle.sh -y                               # push+run every mapped kernel
+#   ./sync_kaggle.sh kaggle_chat_gpu_large.ipynb -y   # push+run just one
+#
+# WARNING: `kaggle kernels push` has no draft-only mode — it also QUEUES A RUN with the
+# notebook's DEFAULT cell flags. For a specific run (MODEL_SIZE/ADD_DATA), run in the UI.
 #
 # The Kaggle owner is read from your local creds (KAGGLE_USERNAME or
 # ~/.kaggle/kaggle.json), so no username is hardcoded in the repo. For each kernel
@@ -21,7 +25,17 @@ cd "$(dirname "$0")"
 NB_DIR="$(cd .. && pwd)"        # llm_lab/
 MAP="kernels.map"
 BUILD=".build"
-FILTER="${1:-}"
+
+# Push ALSO runs the kernel, so dry-run by default; -y/--yes actually pushes+runs.
+DO_PUSH=0
+FILTER=""
+for a in "$@"; do
+  case "$a" in
+    -y|--yes) DO_PUSH=1 ;;
+    *.ipynb)  FILTER="$a" ;;
+    *) echo "unknown arg: $a (expected a notebook name and/or -y)"; exit 2 ;;
+  esac
+done
 
 command -v kaggle >/dev/null || { echo "kaggle CLI not found — run: pip install kaggle"; exit 1; }
 
@@ -54,8 +68,17 @@ m["language"] = "python"
 m["kernel_type"] = "notebook"
 json.dump(m, open(p, "w"), indent=2)
 PY
-  echo "==> pushing $nb -> $slug"
-  kaggle kernels push -p "$d"
+  if [[ "$DO_PUSH" == 1 ]]; then
+    echo "==> pushing (and RUNNING) $nb -> $slug"
+    kaggle kernels push -p "$d"
+  else
+    echo "[dry-run] would push+run $nb -> $slug   (add -y to do it)"
+  fi
 done < "$MAP"
 
-echo "Done. New versions are DRAFTS — open each kernel and Save & Run to execute."
+if [[ "$DO_PUSH" == 1 ]]; then
+  echo "Pushed. Each push QUEUED A RUN with the notebook's DEFAULT cell flags —"
+  echo "for a specific MODEL_SIZE/ADD_DATA run, use the Kaggle UI (Save & Run All)."
+else
+  echo "Dry-run only — nothing pushed. Re-run with -y to push+run."
+fi
