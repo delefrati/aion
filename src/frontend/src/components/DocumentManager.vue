@@ -16,6 +16,7 @@ const success = ref("");
 const fileInput = ref<HTMLInputElement | null>(null);
 const selectedDocId = ref<string | null>(null);
 const selectedDocContent = ref("");
+const MAX_DOCUMENT_SIZE_BYTES = 20 * 1024 * 1024;
 
 onMounted(async () => {
   await loadDocuments();
@@ -25,6 +26,12 @@ async function handleFileUpload(event: Event) {
   const target = event.target as HTMLInputElement;
   const file = target.files?.[0];
   if (!file) return;
+
+  if (file.size > MAX_DOCUMENT_SIZE_BYTES) {
+    error.value = "Files must be 20 MB or smaller.";
+    target.value = "";
+    return;
+  }
 
   loading.value = true;
   error.value = "";
