@@ -27,6 +27,7 @@ gpus: 1                # single GPU. 2x T4 DDP OOM-kills Kaggle's ~13GB host on 
 max_steps: 72000
 eval_every: 500
 checkpoint_every: 500
+checkpoint_keep_last: 0  # only latest.pt+best.pt on disk — Kaggle GPU shares the ~20GB /tmp wall and the 5B (10GB) tokenized cache; harmless on Colab (checkpoints go to Drive)
 log_every: 50
 max_eval_batches: 20
 early_stop_patience: 20
