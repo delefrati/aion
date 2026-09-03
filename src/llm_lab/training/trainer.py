@@ -517,7 +517,8 @@ def train(cfg: TrainConfig) -> dict:
             # checkpoint
             if (step + 1) % cfg.checkpoint_every == 0 and (is_tpu or is_master):
                 _save_checkpoint(
-                    model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu
+                    model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu,
+                    keep_last=getattr(cfg, "checkpoint_keep_last", 2),
                 )
 
             # on-demand checkpoint via SIGUSR1 (single-process only — unsynced save deadlocks XLA)
@@ -543,7 +544,8 @@ def train(cfg: TrainConfig) -> dict:
     if world_size > 1:
         val_loss = _reduce_mean(val_loss, is_tpu, device)
     if is_tpu or is_master:
-        _save_checkpoint(model, optimizer, scheduler, cfg.max_steps, metrics_log, ckpt_dir, is_tpu=is_tpu)
+        _save_checkpoint(model, optimizer, scheduler, cfg.max_steps, metrics_log, ckpt_dir, is_tpu=is_tpu,
+                         keep_last=getattr(cfg, "checkpoint_keep_last", 2))
 
     # save metrics
     if is_master:
@@ -759,9 +761,10 @@ def _save_checkpoint(
     (ckpt_dir / "metrics.json").write_text(json.dumps(metrics_log))
     tqdm.write(f"Checkpoint saved: {path}")
 
-    # Auto-cleanup: keep only the last N numbered checkpoints
+    # Auto-cleanup: keep only the last N numbered checkpoints (0 = keep none; latest.pt
+    # is a separate copy, so resume still works). [:-0] is [:0]==empty, so guard keep_last=0.
     numbered = sorted(ckpt_dir.glob("step_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
-    for old in numbered[:-keep_last]:
+    for old in (numbered[:-keep_last] if keep_last > 0 else numbered):
         old.unlink()
         tqdm.write(f"Removed old checkpoint: {old.name}")
 

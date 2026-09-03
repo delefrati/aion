@@ -43,6 +43,7 @@ seed: 42
 
 checkpoint_dir: checkpoints/transformer_tpu_large
 checkpoint_every: 500
+checkpoint_keep_last: 0  # only latest.pt+best.pt on disk (no step_*.pt archives) — the 5B train.bin (10GB) leaves no room for archives on Kaggle's ~20GB disk
 eval_every: 500
 log_every: 50
 max_eval_batches: 20

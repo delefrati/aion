@@ -48,6 +48,7 @@ class TrainConfig:
     # checkpointing
     checkpoint_dir: str = "checkpoints"
     checkpoint_every: int = 500
+    checkpoint_keep_last: int = 2  # numbered step_*.pt archives to keep; 0 = only latest.pt+best.pt (saves ~keep_last*ckpt_size of disk)
     eval_every: int = 250
     log_every: int = 50
     max_eval_batches: int = 0  # 0 = all
