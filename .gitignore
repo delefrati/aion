@@ -23,6 +23,9 @@ __pycache__/
 node_modules/
 dist/
 
+# Generated notebook builds
+src/llm_lab/tools/.build/
+
 # IDE
 .vscode/
 kaggle.json

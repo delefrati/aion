@@ -90,13 +90,32 @@ def main() -> None:
                         n_train += 1
     print(f"   train lines {n_train:,} | dropped (val-hashed) {n_drop:,}")
 
-    # 4. Tokenize train.txt -> train.bin with the FROZEN tokenizer.
+    # 4. Tokenize train.txt -> train.bin with the FROZEN tokenizer. Inlined (mirrors
+    #    data/dataset.py) so the builder needs only tokenizers+numpy, not torch.
+    import numpy as np
     from tokenizers import Tokenizer
-    from llm_lab.data.dataset import TextDataset
     shutil.copy2(tok_json, build / "tokenizer.json")
     print("== tokenizing train.txt -> train.bin")
-    TextDataset(train_txt, Tokenizer.from_file(str(tok_json)), seq_len=args.seq_len)
+    tok = Tokenizer.from_file(str(tok_json))
     train_bin = build / "train.bin"
+    BATCH_BYTES = 4 * 1024 * 1024  # ~4MB of text per encode_batch call
+
+    def _flush(lines, out):
+        for enc in tok.encode_batch(lines):
+            out.write(np.asarray(enc.ids, dtype=np.uint16).tobytes())
+
+    buf: list[str] = []
+    buf_bytes = 0
+    with open(train_txt, "r", encoding="utf-8") as f, open(train_bin, "wb") as out:
+        for line in f:
+            buf.append(line)
+            buf_bytes += len(line)
+            if buf_bytes >= BATCH_BYTES:
+                _flush(buf, out)
+                buf.clear()
+                buf_bytes = 0
+        if buf:
+            _flush(buf, out)
     train_txt.unlink()  # reclaim disk; keep only the .bin
 
     # 5. Assemble the cache dir (frozen val + tokenizer + new train).
