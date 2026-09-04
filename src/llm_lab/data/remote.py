@@ -102,25 +102,45 @@ def publish(
 
     title = title or f"Tokenized cache {tag}"
     notes = notes or f"AION tokenized data cache: {', '.join(files)}"
-    asset_args = [str(a) for a in assets]
 
-    # Create the release, or upload into it (clobbering) if the tag already exists.
+    # Create the (empty) release if it doesn't exist yet — assets are uploaded one at a
+    # time below so a dropped connection only costs the in-flight asset, not a re-upload
+    # of everything: a single `gh release create <assets...>` call has no way to record
+    # which assets got through before it died, so a retry re-sends the lot with --clobber.
     create = subprocess.run(
-        ["gh", "release", "create", tag, *asset_args,
-         "--repo", repo, "--title", title, "--notes", notes],
+        ["gh", "release", "create", tag, "--repo", repo, "--title", title, "--notes", notes],
         capture_output=True, text=True,
     )
     if create.returncode != 0:
         stderr = (create.stderr or "").lower()
         if "already exists" not in stderr and "release.tag_name already_exists" not in stderr:
             raise RuntimeError(f"gh release create failed:\n{create.stderr}")
-        print(f"Release {tag} exists; uploading assets with --clobber.")
+        print(f"Release {tag} already exists; resuming asset upload.")
+
+    # Skip assets already on the release at the right size, so a re-run after a partial
+    # failure only sends what didn't make it last time.
+    existing: dict[str, int] = {}
+    view = subprocess.run(
+        ["gh", "release", "view", tag, "--repo", repo, "--json", "assets"],
+        capture_output=True, text=True,
+    )
+    if view.returncode == 0:
+        existing = {a["name"]: a["size"] for a in json.loads(view.stdout)["assets"]}
+
+    for asset in assets:
+        if existing.get(asset.name) == asset.stat().st_size:
+            print(f"{asset.name}: already on release, skipping")
+            continue
+        print(f"Uploading {asset.name}...")
         up = subprocess.run(
-            ["gh", "release", "upload", tag, *asset_args, "--repo", repo, "--clobber"],
+            ["gh", "release", "upload", tag, str(asset), "--repo", repo, "--clobber"],
             capture_output=True, text=True,
         )
         if up.returncode != 0:
-            raise RuntimeError(f"gh release upload failed:\n{up.stderr}")
+            raise RuntimeError(
+                f"gh release upload failed on {asset.name}:\n{up.stderr}\n"
+                "Already-uploaded assets are kept — re-run publish() to resume."
+            )
 
     # Chunk files are throwaway once uploaded.
     for entry in manifest["files"].values():
