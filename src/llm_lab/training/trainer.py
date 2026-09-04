@@ -366,6 +366,20 @@ def train(cfg: TrainConfig) -> dict:
     # entire recovery as "no improvement" and stops prematurely.
     early_stop_best = float("inf")
 
+    # ...but that per-session reset also means patience must fit inside one session, or
+    # the counter never reaches it and early stopping is silently dead. The first eval
+    # always resets the counter (inf), so a session affords evals-1 increments.
+    _patience = getattr(cfg, "early_stop_patience", 0)
+    if _patience > 0 and is_master:
+        _evals_this_session = (cfg.max_steps - start_step) // max(cfg.eval_every, 1)
+        if _patience > _evals_this_session - 1:
+            tqdm.write(
+                f"Note: early_stop_patience={_patience} exceeds this session's "
+                f"{_evals_this_session} evals ({cfg.max_steps - start_step} steps / "
+                f"eval_every {cfg.eval_every}) — early stopping cannot trigger. "
+                f"Lower it to <= {max(_evals_this_session - 1, 1)} to arm it."
+            )
+
     # training loop
     model.train()
     data_iter = iter(train_loader)
@@ -744,16 +758,24 @@ def _save_checkpoint(
         _write_ckpt(best_ckpt, ckpt_dir / "best.pt", is_tpu)
         return
 
-    path = ckpt_dir / f"step_{step}.pt"
     latest = ckpt_dir / "latest.pt"
-    _write_ckpt(ckpt, path, is_tpu)
-    if is_tpu:
-        # xm.save is a collective — every core must call it; can't substitute a file copy.
-        _write_ckpt(ckpt, latest, is_tpu)
+    if keep_last > 0:
+        path = ckpt_dir / f"step_{step}.pt"
+        _write_ckpt(ckpt, path, is_tpu)
+        if is_tpu:
+            # xm.save is a collective — every core must call it; can't substitute a file copy.
+            _write_ckpt(ckpt, latest, is_tpu)
+        else:
+            # Serialize once, then copy the file for latest.pt instead of re-serializing the
+            # whole ~GB checkpoint a second time (halves the save-time work and write burst).
+            shutil.copyfile(path, latest)
     else:
-        # Serialize once, then copy the file for latest.pt instead of re-serializing the
-        # whole ~GB checkpoint a second time (halves the save-time work and write burst).
-        shutil.copyfile(path, latest)
+        # keep_last=0 archives nothing, so write latest.pt directly. Writing step_N.pt first
+        # and unlinking it below doubled the bytes per save for no benefit — ~2.8GB of extra
+        # traffic to the Drive FUSE mount every checkpoint on the 235M Colab run.
+        # (keep_last is uniform across ranks, so TPU cores still call _write_ckpt in lockstep.)
+        path = latest
+        _write_ckpt(ckpt, latest, is_tpu)
 
     # Aux files + cleanup: master only (xm.save already wrote only on master)
     if is_tpu and not xm.is_master_ordinal():
@@ -761,8 +783,9 @@ def _save_checkpoint(
     (ckpt_dir / "metrics.json").write_text(json.dumps(metrics_log))
     tqdm.write(f"Checkpoint saved: {path}")
 
-    # Auto-cleanup: keep only the last N numbered checkpoints (0 = keep none; latest.pt
-    # is a separate copy, so resume still works). [:-0] is [:0]==empty, so guard keep_last=0.
+    # Auto-cleanup: keep only the last N numbered checkpoints. With keep_last=0 nothing
+    # numbered is written any more, so this just sweeps archives left by earlier sessions
+    # (or an interrupt save, which keeps the default). [:-0] is [:0]==empty, so guard it.
     numbered = sorted(ckpt_dir.glob("step_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
     for old in (numbered[:-keep_last] if keep_last > 0 else numbered):
         old.unlink()

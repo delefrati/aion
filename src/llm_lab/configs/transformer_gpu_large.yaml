@@ -30,7 +30,9 @@ checkpoint_every: 500
 checkpoint_keep_last: 0  # only latest.pt+best.pt on disk — Kaggle GPU shares the ~20GB /tmp wall and the 5B (10GB) tokenized cache; harmless on Colab (checkpoints go to Drive)
 log_every: 50
 max_eval_batches: 20
-early_stop_patience: 20
+early_stop_patience: 8   # must fit one session: 5000 steps / eval_every 500 = 10 evals, and the
+                         # first resets the counter, so anything >9 can never fire (patience is
+                         # per-session by design — see early_stop_best in trainer.py)
 early_stop_min_delta: 0.01
 
 num_workers: 0         # in-process data loading — fewer host procs (memmap needs no copy)
