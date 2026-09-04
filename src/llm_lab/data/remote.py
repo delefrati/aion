@@ -180,21 +180,31 @@ def _opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(_StripAuthOnRedirect)
 
 
-def _download(url: str, dest: Path, headers: dict | None = None, retries: int = 4) -> None:
+def _download(
+    url: str,
+    dest: Path,
+    headers: dict | None = None,
+    retries: int = 4,
+    timeout: int = 60,
+) -> None:
+    # `timeout` bounds each individual socket operation, not the whole transfer, so a
+    # multi-GB part still downloads fine as long as bytes keep arriving. Without it
+    # urllib blocks forever on a stalled connection: the retry loop below never fires
+    # (a hang raises nothing), and a notebook cell just sits there with no error.
     opener = _opener()
     for attempt in range(1, retries + 1):
         try:
             req = urllib.request.Request(
                 url, headers={"User-Agent": "aion-llm-lab", **(headers or {})}
             )
-            with opener.open(req) as resp, dest.open("wb") as out:
+            with opener.open(req, timeout=timeout) as resp, dest.open("wb") as out:
                 while True:
                     block = resp.read(_CHUNK)
                     if not block:
                         break
                     out.write(block)
             return
-        except (urllib.error.URLError, urllib.error.HTTPError) as exc:
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
             if attempt == retries:
                 raise
             print(f"  download attempt {attempt} failed ({exc}); retrying in 5s...")
