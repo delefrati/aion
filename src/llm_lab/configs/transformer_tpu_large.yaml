@@ -47,5 +47,6 @@ checkpoint_keep_last: 0  # only latest.pt+best.pt on disk (no step_*.pt archives
 eval_every: 500
 log_every: 50
 max_eval_batches: 20
-early_stop_patience: 20
+early_stop_patience: 8    # must fit one session: 5000 steps / eval_every 500 = 10 evals,
+                         # and the first resets the counter, so >9 can never fire
 early_stop_min_delta: 0.01
