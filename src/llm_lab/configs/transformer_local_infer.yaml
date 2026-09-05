@@ -1,0 +1,22 @@
+# Local inference for the 235M base — eval/generate off a checkpoint synced to
+# training-data/. Geometry must match the checkpoint exactly (untied lm_head, 235M);
+# copied from the run.yaml the training sessions write next to the weights.
+#
+#   python -m llm_lab.cli generate --config src/llm_lab/configs/transformer_local_infer.yaml \
+#     --checkpoint training-data/aion-transformer-tpu-large/best.pt --prompt "..."
+#
+# Paths are relative to the repo root, so run it from there. This is an inference-only
+# config: no train_path/val_path, and nothing here is used to resume training.
+model_type: transformer
+d_model: 1024
+n_layers: 16
+n_heads: 16
+vocab_size: 16384
+seq_len: 1024
+dropout: 0.0            # inference — the 0.1 used in training would add sampling noise
+tie_embeddings: false   # the TPU checkpoint is UNTIED (235M); tying here fails to load
+
+tokenizer_path: training-data/aion-transformer-tpu-large/tokenizer.json
+checkpoint_dir: training-data/aion-transformer-tpu-large
+train_path: ''
+val_path: ''
