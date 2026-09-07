@@ -20,7 +20,7 @@ def train_bpe(
 ) -> Tokenizer:
     """Train a byte-level BPE tokenizer and save it."""
     if special_tokens is None:
-        special_tokens = ["<pad>", "<eos>", "<unk>"]
+        special_tokens = ["<pad>", "<eos>", "<unk>", "<|user|>", "<|assistant|>", "<|end|>"]
 
     tokenizer = Tokenizer(BPE(unk_token="<unk>"))
     tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
