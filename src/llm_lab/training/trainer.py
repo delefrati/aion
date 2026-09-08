@@ -499,6 +499,7 @@ def train(cfg: TrainConfig) -> dict:
                         _save_checkpoint(
                             model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir,
                             is_tpu=is_tpu, best=True, best_val_loss=best_val_loss,
+                            is_master=is_master,
                         )
                     if is_master:
                         tqdm.write(f"New best val_loss {best_val_loss:.4f} at step {best_step} (saved: best.pt)")
@@ -518,7 +519,7 @@ def train(cfg: TrainConfig) -> dict:
                             f"{evals_since_improve} evals (best {best_val_loss:.4f} @ step {best_step})."
                         )
                     if is_tpu or is_master:
-                        _save_checkpoint(model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu)
+                        _save_checkpoint(model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu, is_master=is_master)
                     if is_master:
                         (ckpt_dir / "metrics.json").write_text(json.dumps(metrics_log, indent=2))
                     return {
@@ -531,7 +532,7 @@ def train(cfg: TrainConfig) -> dict:
             # checkpoint
             if (step + 1) % cfg.checkpoint_every == 0 and (is_tpu or is_master):
                 _save_checkpoint(
-                    model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu,
+                    model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu, is_master=is_master,
                     keep_last=getattr(cfg, "checkpoint_keep_last", 2),
                 )
 
@@ -540,7 +541,8 @@ def train(cfg: TrainConfig) -> dict:
                 _save_requested = False
                 tqdm.write(f"SIGUSR1 received — saving checkpoint at step {step + 1}")
                 _save_checkpoint(
-                    model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu
+                    model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu,
+                    is_master=is_master,
                 )
 
         except KeyboardInterrupt:
@@ -548,7 +550,7 @@ def train(cfg: TrainConfig) -> dict:
             if world_size > 1:
                 raise
             tqdm.write(f"\nInterrupted at step {step + 1} — saving checkpoint before exit...")
-            _save_checkpoint(model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu)
+            _save_checkpoint(model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu, is_master=is_master)
             metrics_path = ckpt_dir / "metrics.json"
             metrics_path.write_text(json.dumps(metrics_log, indent=2))
             return {"interrupted_at_step": step + 1, "param_count": param_count}
@@ -558,7 +560,7 @@ def train(cfg: TrainConfig) -> dict:
     if world_size > 1:
         val_loss = _reduce_mean(val_loss, is_tpu, device)
     if is_tpu or is_master:
-        _save_checkpoint(model, optimizer, scheduler, cfg.max_steps, metrics_log, ckpt_dir, is_tpu=is_tpu,
+        _save_checkpoint(model, optimizer, scheduler, cfg.max_steps, metrics_log, ckpt_dir, is_tpu=is_tpu, is_master=is_master,
                          keep_last=getattr(cfg, "checkpoint_keep_last", 2))
 
     # save metrics
@@ -734,6 +736,7 @@ def seed_checkpoint(src: Path, dst: Path) -> None:
 def _save_checkpoint(
     model, optimizer, scheduler, step: int, metrics_log: list, ckpt_dir: Path,
     keep_last: int = 2, is_tpu: bool = False, best: bool = False, best_val_loss: float | None = None,
+    is_master: bool = True,
 ) -> None:
     ckpt = {
         "step": step,
@@ -777,8 +780,13 @@ def _save_checkpoint(
         path = latest
         _write_ckpt(ckpt, latest, is_tpu)
 
-    # Aux files + cleanup: master only (xm.save already wrote only on master)
-    if is_tpu and not xm.is_master_ordinal():
+    # Aux files + cleanup: master only (xm.save already wrote only on master).
+    # Use the caller's is_master, which comes from xr.global_ordinal() like every other
+    # rank check in this file. This used to call xm.is_master_ordinal(), a DIFFERENT api
+    # that defaults to the *local* ordinal — when the two disagreed, latest.pt (written
+    # above) still updated but metrics.json did not, so the notebooks' auto-push watcher
+    # polled a step counter frozen at the resume point and never banked anything.
+    if is_tpu and not is_master:
         return
     (ckpt_dir / "metrics.json").write_text(json.dumps(metrics_log))
     tqdm.write(f"Checkpoint saved: {path}")
