@@ -12,7 +12,12 @@ BUDGETS = {
     "pretrain_large": 72000,       # 235M base: compute-optimal ~4.7B tokens (needs pretrain_xl data to avoid repeats)
     "pretrain_medium": 20000,      # 110M base pretrain
     "pretrain_tpu_medium": 40000,  # 110M TPU continue (20k->40k warm restart)
-    "chat_large": 8000,            # 235M chat finetune — overfits past ~7.5k, cap at the knee
+    # 235M chat finetune. The old 8000 cap was the knee for a ~94k-example corpus (~2.6k
+    # steps/epoch at eff batch 32): val bottomed at 1.766 @7.5k = ~3 epochs, then climbed.
+    # The corpus is now ~225k examples (~7k steps/epoch), so the same ~3 epochs lands near
+    # 20k. Treat this as a ceiling, not a target — re-read the val curve after the first two
+    # sessions and pull it in if the sawtooth minima start rising again.
+    "chat_large": 20000,
     "chat_medium": 20000,          # 110M chat finetune
     "chat_multisession": 20000,    # generic multi-session chat finetune
 }

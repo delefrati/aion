@@ -37,5 +37,5 @@ checkpoint_every: 500
 eval_every: 250
 log_every: 50
 max_eval_batches: 20
-early_stop_patience: 3
+early_stop_patience: 6   # 6 x eval_every(250) = 1500 steps; 3 tripped on epoch-boundary val spikes
 early_stop_min_delta: 0.01
