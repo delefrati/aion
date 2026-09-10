@@ -7,6 +7,7 @@ import math
 import os
 import shutil
 import signal
+import sys
 import threading
 import time
 from pathlib import Path
@@ -645,6 +646,14 @@ def train_multicore(cfg: TrainConfig) -> None:
 def _ddp_worker(rank: int, world_size: int, cfg: TrainConfig) -> None:
     """One process per GPU: init the NCCL group, then run the standard training loop."""
     import torch.distributed as dist
+    # mp.spawn hands this child a plain block-buffered pipe for stdout instead of the
+    # notebook kernel's auto-flushing stream. tqdm.write (train/val lines) goes to stdout
+    # while the progress bar goes to stderr, so at log_every=50 + eval_every=500 a whole
+    # 5000-step session emits ~6KB — under the 8KB buffer — and NO loss line ever reaches
+    # the log, even though the bar streams fine. Line-buffer it so eval output appears as
+    # it happens and survives a hard timeout, which never runs the exit-time flush.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     os.environ["RANK"] = str(rank)
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)

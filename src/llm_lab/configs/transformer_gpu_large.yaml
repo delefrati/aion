@@ -21,8 +21,11 @@ lr_decay_steps: 72000   # extended to compute-optimal (~4.7B tokens); anneals ov
 weight_decay: 0.01
 use_8bit_optim: false  # TPU checkpoint used standard AdamW; match it so optimizer state resumes cleanly
 tie_embeddings: false  # torch_xla broke the lm_head/embedding tie on TPU, so the checkpoint is UNTIED (235M); build untied here to match
-gpus: 1                # single GPU. 2x T4 DDP OOM-kills Kaggle's ~13GB host on a 235M resume
-                       # (each rank loads the 2.8GB ckpt). Set gpus: 0 to try all GPUs anyway.
+gpus: 1                # single GPU — the safe default for launchers that read this config
+                       # directly. The Kaggle notebook's USE_BOTH_GPUS overrides it to 0, and
+                       # 2x T4 DDP does work: 5.88s/step sustained over a full 8h session, once
+                       # Cell 2 frees its own copy of the ckpt so both ranks can load it
+                       # without OOMing the ~13GB host. Set 0 here to opt into DDP directly.
 
 max_steps: 72000
 eval_every: 500
@@ -33,7 +36,9 @@ max_eval_batches: 20
 early_stop_patience: 8   # must fit one session: 5000 steps / eval_every 500 = 10 evals, and the
                          # first resets the counter, so anything >9 can never fire (patience is
                          # per-session by design — see early_stop_best in trainer.py)
-early_stop_min_delta: 0.01
+early_stop_min_delta: 0.002  # 0.01 was coarser than the curve past ~12k steps, where val
+                         # improves ~0.002-0.02 per eval — 8 straight sub-0.01 evals would have
+                         # early-stopped at ~20% of the 72k schedule with the LR still near peak.
 
 num_workers: 0         # in-process data loading — fewer host procs (memmap needs no copy)
 foreach_optim: false   # avoid the foreach-AdamW transient spike that OOMs the T4 at step 1
