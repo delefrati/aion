@@ -397,6 +397,7 @@ def merge_chat_datasets(raw_dir: Path, out_path: Path, seed_path: Path | None = 
       - ultrachat.json         — HuggingFaceH4/ultrachat_200k multi-turn (if present)
       - hh_rlhf.json           — Anthropic multi-turn (if present)
       - dolly_15k.json         — converted from {instruction,response} to {messages}
+      - no_robots.json         — same conversion (human-written, high quality)
       - seed_path              — AION identity / custom examples (instruction_seed.json)
 
     All examples are shuffled with a fixed seed and written as a flat list of
@@ -421,10 +422,12 @@ def merge_chat_datasets(raw_dir: Path, out_path: Path, seed_path: Path | None = 
                 print(f"  {fname}: {len(data)} conversations")
             examples.extend(data)
 
-    # Dolly — single-turn, convert to {messages}
-    dolly_path = raw_dir / "dolly_15k.json"
-    if dolly_path.exists():
-        data = json.loads(dolly_path.read_text(encoding="utf-8"))
+    # Single-turn {instruction, context, response} files — convert to {messages}
+    for fname in ("dolly_15k.json", "no_robots.json"):
+        p = raw_dir / fname
+        if not p.exists():
+            continue
+        data = json.loads(p.read_text(encoding="utf-8"))
         converted = [
             {"messages": [
                 {"role": "user", "content": (row.get("context", "").strip() + "\n\n" + row["instruction"]).strip()},
@@ -434,7 +437,7 @@ def merge_chat_datasets(raw_dir: Path, out_path: Path, seed_path: Path | None = 
             if row.get("instruction") and row.get("response")
         ]
         examples.extend(converted)
-        print(f"  dolly_15k.json: {len(converted)} examples")
+        print(f"  {fname}: {len(converted)} examples")
 
     # Custom seed (instruction_seed.json or expand_instructions output)
     if seed_path and seed_path.exists():
@@ -465,7 +468,7 @@ PRESETS = {
     "small": {"slimpajama_mb": 20, "dolly": True, "no_robots": False, "guanaco": False, "hh_rlhf": False},
     "medium": {"slimpajama_mb": 80, "dolly": True, "no_robots": True, "guanaco": False, "hh_rlhf": False},
     "large": {"slimpajama_mb": 200, "dolly": True, "no_robots": True, "guanaco": False, "hh_rlhf": False},
-    "chat": {"slimpajama_mb": 0, "dolly": True, "no_robots": True, "guanaco": False, "oasst1": True, "ultrachat": True, "ultrachat_max": 50000, "hh_rlhf": True},
+    "chat": {"slimpajama_mb": 0, "dolly": True, "no_robots": True, "guanaco": False, "oasst1": True, "ultrachat": True, "ultrachat_max": 150000, "hh_rlhf": True},
     # ~1000+8000 MB ≈ ~2.2B tokens — Chinchilla-optimal for the 110M base and matched to
     # the 40k-step continue budget (~2.6B tokens processed). Raising further only helps if
     # max_steps also goes past 40k, else the model won't see all the extra tokens.
