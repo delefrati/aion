@@ -257,8 +257,16 @@ def _resume_if_available(cfg: TrainConfig, model, optimizer, scheduler, ckpt_dir
                         opt_state[k] = v.to(device)
     if ckpt.get("scheduler") is not None and not reset_opt:
         scheduler.load_state_dict(ckpt["scheduler"])
-    metrics_log = ckpt.get("metrics_log", [])
     step = ckpt["step"]
+    # Drop history from beyond the resumed step. A checkpoint rolled back to an earlier step
+    # keeps the whole metrics_log, so the log can describe steps these weights never reached.
+    # Everything downstream that asks "how far along are we?" by taking max(step) over
+    # metrics.json then reads a counter stuck in the future — including the notebooks'
+    # auto-push watcher, which goes silent for the rest of the run because the counter never
+    # advances past what it already banked.
+    _full_log = ckpt.get("metrics_log", [])
+    metrics_log = [e for e in _full_log if e.get("step", 0) <= step]
+    _dropped = len(_full_log) - len(metrics_log)
     fresh = ckpt.get("optimizer") is None or reset_opt
     # Free the ~2.8GB checkpoint from host RAM before the first step (the CPU copy is no
     # longer needed once weights + optimizer state are on the device).
@@ -269,7 +277,9 @@ def _resume_if_available(cfg: TrainConfig, model, optimizer, scheduler, ckpt_dir
         torch.cuda.empty_cache()
     if is_master:
         tqdm.write(f"Resumed from step {step}"
-                   + (" (fresh optimizer — clean fine-tune start)" if fresh else ""))
+                   + (" (fresh optimizer — clean fine-tune start)" if fresh else "")
+                   + (f"; dropped {_dropped} metrics entries from beyond step {step}"
+                      if _dropped else ""))
     return step, metrics_log
 
 
