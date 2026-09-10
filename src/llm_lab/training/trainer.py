@@ -492,8 +492,12 @@ def train(cfg: TrainConfig) -> dict:
                 if is_master:
                     tqdm.write(f"step {step + 1:>5d} | val_loss {val_loss:.4f}")
                 min_delta = getattr(cfg, "early_stop_min_delta", 0.0)
-                # best.pt: overwrite only when beating the all-time best.
-                if val_loss < best_val_loss - min_delta:
+                # best.pt: overwrite on ANY all-time improvement. min_delta is an
+                # early-stopping threshold ("is progress still worth the compute?") and
+                # must not gate checkpoint selection too — at min_delta=0.01 a genuinely
+                # better eval that improves by less is discarded, leaving best.pt on a
+                # worse step than one the run actually reached.
+                if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_step = step + 1
                     if is_tpu or is_master:
