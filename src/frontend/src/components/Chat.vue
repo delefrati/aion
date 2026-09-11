@@ -82,7 +82,40 @@ async function send() {
     const reader = res.body!.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    let prevEvent: string | null = null;
+    let eventName = "";
+    let dataLines: string[] = [];
+
+    // SSE breaks a payload containing line breaks across several "data:" lines,
+    // so an event is only complete at the blank line that ends it and its data
+    // lines rejoin with "\n" — that is what keeps newlines in a streamed reply.
+    const dispatch = () => {
+      if (!eventName) return;
+      const data = dataLines.join("\n");
+      if (eventName === "token") {
+        messages.value[idx].content += data;
+      } else if (eventName === "sources") {
+        messages.value[idx].sources = data.split(";").filter(s => s.trim());
+      } else if (eventName === "done") {
+        conversationId.value = data;
+      }
+      eventName = "";
+      dataLines = [];
+    };
+
+    const handleLine = (raw: string) => {
+      const line = raw.replace(/\r$/, "");
+      if (line === "") {
+        dispatch();
+        return;
+      }
+      if (line.startsWith(":")) return;  // comment / keep-alive
+      const colon = line.indexOf(":");
+      const field = colon === -1 ? line : line.slice(0, colon);
+      let value = colon === -1 ? "" : line.slice(colon + 1);
+      if (value.startsWith(" ")) value = value.slice(1);
+      if (field === "event") eventName = value;
+      else if (field === "data") dataLines.push(value);
+    };
 
     while (true) {
       const { done, value } = await reader.read();
@@ -91,35 +124,14 @@ async function send() {
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
-
-      for (let line of lines) {
-        line = line.replace(/\r$/, "");
-        if (line.startsWith("event: done")) {
-          // next data line has the conversation id — handled below
-        } else if (line.startsWith("data: ")) {
-          const data = line.slice(6);
-          // if previous line was "event: done", this is the conversation id
-          if (prevEvent === "done") {
-            conversationId.value = data;
-          } else if (prevEvent === "sources") {
-            // Parse and store sources
-            messages.value[idx].sources = data.split(";").filter(s => s.trim());
-            prevEvent = null;
-            continue;
-          } else if (prevEvent === "token") {
-            messages.value[idx].content += data;
-          }
-          prevEvent = null;
-          continue;
-        }
-        if (line.startsWith("event: ")) {
-          prevEvent = line.slice(7);
-        }
-      }
+      for (const line of lines) handleLine(line);
 
       await nextTick();
       messagesEl.value?.scrollTo(0, messagesEl.value.scrollHeight);
     }
+    // Flush a stream that ended without a trailing blank line.
+    if (buffer) handleLine(buffer);
+    dispatch();
   } catch (e) {
     messages.value.push({
       role: "assistant",
@@ -150,7 +162,7 @@ async function send() {
               </span>
             </div>
           </div>
-          {{ msg.content }}
+          <div class="content">{{ msg.content }}</div>
         </div>
       </div>
       <div v-if="!messages.length" class="empty">
@@ -242,7 +254,11 @@ async function send() {
   padding: 0.6rem 1rem;
   border-radius: 1rem;
   line-height: 1.5;
+}
+/* Scoped to the text so template indentation never renders as whitespace. */
+.content {
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .sources {
   font-size: 0.85rem;
