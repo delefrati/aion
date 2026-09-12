@@ -16,7 +16,13 @@ instruction_data: ""
 
 batch_size: 8
 grad_accum_steps: 1
-tpu_cores: 8
+tpu_cores: 1  # PINNED SINGLE-CORE, and this is NOT a change in behaviour: tpu_cores was not a
+#               TrainConfig field until now, so it was dropped on load and this run has
+#               ALWAYS trained on one core (tpu_cores: 8 in this file never took effect). Letting it
+#               fan out now would multiply the effective batch by 8 mid-lineage (8 -> 64)
+#               at the same LR, and make every step in the budget worth 8x more data. To go
+#               multi-core deliberately: divide batch_size by 8 first (-> 1 per core),
+#               then re-derive the step budget in run_config.py.
 num_workers: 4
 lr: 1.0e-4
 weight_decay: 0.01

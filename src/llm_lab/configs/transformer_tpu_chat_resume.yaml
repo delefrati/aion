@@ -24,7 +24,13 @@ reset_optimizer: true
 grad_clip: 1.0
 grad_checkpoint: true  # recompute attention in backward — bounds HBM to ~1 layer
 compile: false
-tpu_cores: 0  # 0 = all TPU cores (data-parallel); needs a TPU-clean kernel (Cell 1 must not init XLA)
+tpu_cores: 1  # PINNED SINGLE-CORE, and this is NOT a change in behaviour: tpu_cores was not a
+#               TrainConfig field until now, so it was dropped on load and this run has
+#               ALWAYS trained on one core (tpu_cores: 0 in this file never took effect). Letting it
+#               fan out now would multiply the effective batch by 8 mid-lineage (32 -> 256)
+#               at the same LR, and make every step in the budget worth 8x more data. To go
+#               multi-core deliberately: divide batch_size by 8 first (-> 4 per core),
+#               then re-derive the step budget in run_config.py.
 seed: 42
 
 checkpoint_dir: checkpoints/transformer_tpu_chat

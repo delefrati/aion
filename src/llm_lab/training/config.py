@@ -42,6 +42,8 @@ class TrainConfig:
     use_8bit_optim: bool = True  # 8-bit AdamW when bitsandbytes is present; set False to force standard AdamW (needed to resume a standard-AdamW checkpoint on a GPU image that has bitsandbytes)
     tie_embeddings: bool = True  # share lm_head with input embedding. NOTE: torch_xla breaks the tie on .to(xla), so TPU checkpoints are effectively UNTIED — set False to resume such a checkpoint on GPU.
     gpus: int = 1  # CUDA GPUs to use: 1 = single; 0 = all visible; N = N via DistributedDataParallel
+    tpu_cores: int = 1  # TPU cores: 1 = single core (in-process); anything else (0 or 8) fans
+    #                     out to EVERY core via xmp.spawn. cli.cmd_train branches on != 1.
     foreach_optim: bool = True  # foreach AdamW is faster but allocates temp buffers for ALL params at once (a large transient spike); set False on tight VRAM
     seed: int = 42
 
@@ -75,6 +77,13 @@ class TrainConfig:
     def from_dict(cls, data: dict) -> TrainConfig:
         """Build a config from a dict, ignoring unknown keys and coercing numerics."""
         filtered = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+        # Say out loud what we drop. Silence hid a real bug for months: every TPU config set
+        # tpu_cores, the field did not exist, so cli.cmd_train read the getattr default of 1
+        # and multi-core training was unreachable no matter what the YAML asked for. An
+        # ignored key is either a typo or a knob nobody implemented — both worth seeing.
+        ignored = sorted(set(data) - set(filtered))
+        if ignored:
+            print(f"WARNING: config keys ignored (not TrainConfig fields): {', '.join(ignored)}")
         # coerce numeric fields that YAML may parse as strings (e.g. 5e-4)
         for k, v in filtered.items():
             if isinstance(v, str) and cls.__dataclass_fields__[k].type in ("float", "int"):
