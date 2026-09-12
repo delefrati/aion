@@ -1,6 +1,12 @@
-# Transformer TPU chat — LARGE (~235M) conversational model on Kaggle TPU v5e-8.
+# Transformer TPU chat — LARGE (~235M) conversational model on Kaggle TPU v5e.
 # Fine-tune on chat data using pretrained weights from transformer_tpu_large.
 # Dims MUST match the base (d_model=1024, n_layers=16, n_heads=16) so the checkpoint loads.
+#
+# This run SHARES its checkpoint Dataset and step budget with the GPU notebook
+# (transformer_gpu_chat_large.yaml): sessions can alternate between T4 and TPU v5e on the
+# same latest.pt. Everything a resumed step depends on — eff batch, lr, warmup, weight
+# decay, eval cadence, early stop — is therefore kept identical to the GPU config; only
+# the device-shaped knobs (batch/accum split, num_workers, tpu_cores) differ.
 model_type: transformer
 vocab_size: 16384
 d_model: 1024
@@ -15,19 +21,24 @@ train_path: ""
 val_path: ""
 tokenizer_path: ""
 
-# 235M is ~2x the medium; halve per-core batch and add 2x accumulation to hold the same
-# effective batch (16 * 2 * 8 cores = 256) within each core's 16GB HBM.
-batch_size: 16
-grad_accum_steps: 2
+# Single-core, eff batch 2 x 16 = 32 — the SAME effective batch as the GPU run (2 x 16 on
+# one T4, 2 x 8 on two), so a step means the same number of examples on both devices and
+# the shared 20k budget stays ~3 epochs either way.
+# batch_size 2 and tpu_cores 1 are the proven 235M settings from transformer_tpu_large:
+# at batch 4 the compiled step reserves ~12.7G and OOMs the v5e core, and multi-core
+# xmp.spawn dies with BrokenProcessPool at this size (8 workers compiling fwd+bwd at once).
+batch_size: 2
+grad_accum_steps: 16
+tpu_cores: 1
 num_workers: 4
+use_8bit_optim: false  # match the GPU run: standard AdamW, so a checkpoint's optimizer state is the same shape on both devices
 lr: 1.0e-4          # slightly below the 110M chat LR (1.5e-4) for the bigger model
 weight_decay: 0.05
 max_steps: 20000
 warmup_steps: 500
 grad_clip: 1.0
-grad_checkpoint: true  # recompute attention in backward — bounds HBM to ~1 layer
+grad_checkpoint: true  # essential at 235M — XLA has no flash-attention, scores materialize per layer
 compile: false
-tpu_cores: 0  # 0 = all TPU cores (data-parallel); needs a TPU-clean kernel (Cell 1 must not init XLA)
 seed: 42
 
 checkpoint_dir: checkpoints/transformer_tpu_chat_large
@@ -35,5 +46,5 @@ checkpoint_every: 500
 eval_every: 250
 log_every: 50
 max_eval_batches: 20
-early_stop_patience: 3
+early_stop_patience: 6   # matches the GPU config: 3 tripped on epoch-boundary val spikes
 early_stop_min_delta: 0.01

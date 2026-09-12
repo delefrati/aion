@@ -1,5 +1,8 @@
 # Transformer TPU chat LARGE — resume config for subsequent sessions.
 # Lower LR, short warmup, reset optimizer. Dims must match transformer_tpu_chat_large.
+# Shares checkpoints + budget with transformer_gpu_chat_large_resume.yaml; keep lr, warmup,
+# weight decay and effective batch (32) identical to it so alternating device sessions stay
+# on one continuous schedule.
 model_type: transformer
 vocab_size: 16384
 d_model: 1024
@@ -14,18 +17,19 @@ train_path: ""
 val_path: ""
 tokenizer_path: ""
 
-batch_size: 16
-grad_accum_steps: 2
+batch_size: 2          # 2 x 16 = eff batch 32, same as the GPU run; 4 OOMs the v5e core at 235M
+grad_accum_steps: 16
+tpu_cores: 1           # multi-core xmp.spawn BrokenProcessPools at this size
 num_workers: 4
+use_8bit_optim: false  # match the GPU run: standard AdamW, so a checkpoint's optimizer state is the same shape on both devices
 lr: 3.0e-5
 weight_decay: 0.05
 max_steps: 5000
 warmup_steps: 100
 reset_optimizer: true
 grad_clip: 1.0
-grad_checkpoint: true  # recompute attention in backward — bounds HBM to ~1 layer
+grad_checkpoint: true  # essential at 235M — XLA has no flash-attention, scores materialize per layer
 compile: false
-tpu_cores: 0  # 0 = all TPU cores (data-parallel); needs a TPU-clean kernel (Cell 1 must not init XLA)
 seed: 42
 
 checkpoint_dir: checkpoints/transformer_tpu_chat_large
@@ -33,5 +37,5 @@ checkpoint_every: 500
 eval_every: 250
 log_every: 50
 max_eval_batches: 20
-early_stop_patience: 3
+early_stop_patience: 6   # matches the GPU config: 3 tripped on epoch-boundary val spikes
 early_stop_min_delta: 0.01
