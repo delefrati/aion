@@ -58,6 +58,23 @@ def _autocast_context(is_tpu: bool, use_amp: bool):
     return contextlib.nullcontext()
 
 
+def _masked_ce(logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cross-entropy over supervised tokens: returns (mean loss, supervised-token count).
+
+    Chat batches can have NO supervised tokens: MultiTurnDataset masks user turns with
+    -100, and a conversation whose first user turn fills seq_len (or whose reply is empty)
+    has every assistant token truncated away. F.cross_entropy's reduction="mean" then
+    divides by zero and returns NaN. Sum / clamp(count, 1) is identical whenever count > 0,
+    and gives 0 (not NaN) otherwise. No data-dependent branch, so XLA compiles one graph.
+    """
+    flat = labels.view(-1)
+    loss_sum = torch.nn.functional.cross_entropy(
+        logits.view(-1, logits.size(-1)), flat, ignore_index=-100, reduction="sum"
+    )
+    n_tok = (flat != -100).sum()
+    return loss_sum / n_tok.clamp(min=1), n_tok
+
+
 def _parse_curriculum(curriculum_str: str) -> list[tuple[int, int]]:
     """Parse curriculum string like '256:1000,512:2000,1024:3000' into [(seq_len, until_step), ...]."""
     if not curriculum_str:
@@ -444,9 +461,9 @@ def train(cfg: TrainConfig) -> dict:
                 with _sync_ctx:
                     with _autocast_context(is_tpu, use_amp):
                         logits = model(input_ids)
-                        loss = torch.nn.functional.cross_entropy(
-                            logits.view(-1, logits.size(-1)), labels.view(-1)
-                        )
+                        # 0 with zero grads (not NaN) on a micro-batch with no supervised
+                        # tokens. TPU has no GradScaler to skip a NaN step for us.
+                        loss, _ = _masked_ce(logits, labels)
                         loss = loss / accum_steps  # normalize for accumulation
 
                     if is_tpu:
@@ -703,19 +720,26 @@ def train_ddp(cfg: TrainConfig) -> None:
 def evaluate(model, loader: DataLoader, device: torch.device, max_batches: int = 0) -> float:
     model.eval()
     total_loss = 0.0
-    n = 0
+    n = 0       # batches consumed — still capped by max_batches, so every eval scores the same slice
+    scored = 0  # batches that had supervised tokens
     for batch in loader:
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
         logits = model(input_ids)
-        loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)), labels.view(-1)
-        )
-        total_loss += loss.item()
+        loss, n_tok = _masked_ce(logits, labels)
+        loss, n_tok = torch.stack([loss.float(), n_tok.float()]).tolist()  # one host sync
         n += 1
+        # Skip a batch with no supervised tokens rather than averaging in its NaN — one such
+        # batch among max_eval_batches turned the whole val_loss NaN, which never beats
+        # best_val_loss and counts against early-stop patience on every eval. Skipping
+        # (rather than counting it as 0) keeps this the same mean-of-batch-means as before,
+        # so val_loss stays comparable with the run's existing history.
+        if n_tok > 0:
+            total_loss += loss
+            scored += 1
         if max_batches > 0 and n >= max_batches:
             break
-    return total_loss / max(n, 1)
+    return total_loss / scored if scored else float("nan")
 
 
 def _write_ckpt(ckpt: dict, path: Path, is_tpu: bool) -> None:
