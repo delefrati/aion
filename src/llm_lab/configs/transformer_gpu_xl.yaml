@@ -15,7 +15,7 @@ n_layers: 20
 n_heads: 18
 vocab_size: 16384
 seq_len: 1024
-dropout: 0.1
+dropout: 0.0  # single-pass pretraining (no repeated data): dropout only slows learning. Chat configs keep 0.1.
 
 batch_size: 1
 grad_accum_steps: 64

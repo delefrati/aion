@@ -27,6 +27,7 @@ def build_model(cfg: TrainConfig):
             seq_len=cfg.seq_len,
             use_grad_checkpoint=cfg.grad_checkpoint,
             tie_embeddings=getattr(cfg, "tie_embeddings", True),
+            dropout=cfg.dropout,
         )
     else:
         raise ValueError(f"Unknown model_type: {cfg.model_type}")

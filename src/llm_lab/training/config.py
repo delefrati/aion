@@ -41,6 +41,7 @@ class TrainConfig:
     reset_optimizer: bool = False  # skip restoring optimizer/scheduler from checkpoint (use config lr)
     use_8bit_optim: bool = True  # 8-bit AdamW when bitsandbytes is present; set False to force standard AdamW (needed to resume a standard-AdamW checkpoint on a GPU image that has bitsandbytes)
     tie_embeddings: bool = True  # share lm_head with input embedding. NOTE: torch_xla breaks the tie on .to(xla), so TPU checkpoints are effectively UNTIED — set False to resume such a checkpoint on GPU.
+    dropout: float = 0.0  # transformer residual/attention/MLP dropout; train-time only (eval()/generate disable it)
     gpus: int = 1  # CUDA GPUs to use: 1 = single; 0 = all visible; N = N via DistributedDataParallel
     tpu_cores: int = 1  # TPU cores: 1 = single core (in-process); anything else (0 or 8) fans
     #                     out to EVERY core via xmp.spawn. cli.cmd_train branches on != 1.
