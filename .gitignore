@@ -29,3 +29,6 @@ src/llm_lab/tools/.build/
 # IDE
 .vscode/
 kaggle.json
+
+# Playwright browser cache
+.playwright-mcp/
