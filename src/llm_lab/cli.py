@@ -161,6 +161,49 @@ def cmd_eval(args):
     print(f"Perplexity on val set: {ppl:.2f}")
 
 
+def cmd_bench(args):
+    import json
+    import torch
+    from llm_lab.training.config import TrainConfig
+    from llm_lab.eval.benchmarks import TASKS, HEADLINE, run_task, load_checkpoint_model, format_table
+    from llm_lab.tokenizer.bpe import load_tokenizer
+    from llm_lab.utils import pick_device
+
+    cfg = TrainConfig.load(Path(args.config))
+    device = pick_device()
+    tokenizer = load_tokenizer(Path(args.tokenizer or cfg.tokenizer_path))
+    tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
+    unknown = [t for t in tasks if t not in TASKS]
+    if unknown:
+        raise SystemExit(f"Unknown task(s) {unknown}. Known: {sorted(TASKS)}")
+
+    out = Path(args.out) if args.out else None
+    results = json.loads(out.read_text()) if out and out.exists() else {}
+    for spec in args.checkpoint:
+        label, _, path = spec.rpartition("=")
+        label = label or Path(path).stem
+        model, step = load_checkpoint_model(cfg, Path(path), device)
+        entry = {"checkpoint": path, "step": step, "limit": args.limit, "tasks": {}}
+        print(f"== {label}: {path} @ step {step:,} on {device}")
+        for t in tasks:
+            r = run_task(model, tokenizer, t, cfg.seq_len, device,
+                         batch_size=args.batch_size, limit=args.limit)
+            entry["tasks"][t] = r
+            k = HEADLINE[t]
+            print(f"  {t:<14} {k} {100 * r[k]:.1f} ± {100 * r[k + '_stderr']:.1f}  "
+                  f"(acc {100 * r['acc']:.1f}, acc_norm {100 * r['acc_norm']:.1f}, "
+                  f"n={r['n']}, {r['seconds']:.0f}s)")
+        results[label] = entry
+        if out:  # after each checkpoint, so a crash later keeps what finished
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(results, indent=2))
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    print()
+    print(format_table(results))
+
+
 def cmd_generate(args):
     import torch
     from llm_lab.training.config import TrainConfig
@@ -283,6 +326,17 @@ def main():
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--config", required=True)
 
+    # bench
+    p = sub.add_parser("bench", help="Zero-shot HellaSwag/ARC/PIQA accuracy of checkpoints")
+    p.add_argument("--config", required=True, help="Train config matching the checkpoints' architecture")
+    p.add_argument("--checkpoint", required=True, action="append",
+                   help="[label=]path; repeat to compare several checkpoints")
+    p.add_argument("--tokenizer", default=None, help="Override tokenizer path from config")
+    p.add_argument("--tasks", default="hellaswag,arc_easy,arc_challenge,piqa")
+    p.add_argument("--limit", type=int, default=0, help="First N questions per task (0 = all)")
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--out", default=None, help="JSON results file; existing labels are kept")
+
     # generate
     p = sub.add_parser("generate", help="Generate text from a checkpoint")
     p.add_argument("--checkpoint", required=True)
@@ -320,6 +374,7 @@ def main():
         "train": cmd_train,
         "eval": cmd_eval,
         "generate": cmd_generate,
+        "bench": cmd_bench,
         "finetune": cmd_finetune,
     }
     commands[args.command](args)
