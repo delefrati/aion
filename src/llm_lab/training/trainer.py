@@ -25,6 +25,9 @@ except ImportError:
 # Global flag for on-demand checkpoint save (set via SIGUSR1)
 _save_requested = False
 
+# SPMD device mesh when one process drives every TPU chip (cfg.tpu_spmd); None otherwise.
+_spmd_mesh = None
+
 
 def _handle_save_signal(signum, frame):
     global _save_requested
@@ -56,6 +59,30 @@ def _autocast_context(is_tpu: bool, use_amp: bool):
     if use_amp:
         return torch.amp.autocast("cuda", enabled=True)
     return contextlib.nullcontext()
+
+
+def _init_spmd_mesh():
+    """Build a 1-D 'data' mesh over every TPU chip for the SPMD path (xr.use_spmd() done)."""
+    import numpy as np
+    import torch_xla.distributed.spmd as xs
+    import torch_xla.runtime as xr
+    n = xr.global_runtime_device_count()
+    return xs.Mesh(np.arange(n), (n,), ("data",))
+
+
+def _to_device(t: torch.Tensor, device) -> torch.Tensor:
+    """Move a [batch, ...] tensor to device; under SPMD, shard its batch dim across chips.
+
+    Params stay replicated (unannotated), so sharding only the inputs makes this plain data
+    parallelism: the SPMD partitioner inserts the gradient all-reduce itself. A batch that
+    doesn't divide by the chip count (a chat val tail) is left replicated rather than
+    unevenly sharded — every chip then computes it in full, which is correct, just slower.
+    """
+    t = t.to(device)
+    if _spmd_mesh is not None and t.size(0) % _spmd_mesh.size() == 0:
+        import torch_xla.distributed.spmd as xs
+        xs.mark_sharding(t, _spmd_mesh, ("data",) + (None,) * (t.dim() - 1))
+    return t
 
 
 def _masked_ce(logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -181,6 +208,10 @@ def _make_loaders(train_path, val_path, tokenizer, seq_len, batch_size, num_work
 
 def _setup_topology(is_tpu: bool) -> tuple[int, int]:
     """Return (world_size, ordinal) for the current process."""
+    if is_tpu and _spmd_mesh is not None:
+        # SPMD: one process owns every chip and the partitioner handles the collectives, so
+        # the loop runs its single-process path (no DistributedSampler, no xm.optimizer_step).
+        return 1, 0
     if is_tpu:
         import torch_xla.runtime as xr
         return xr.world_size(), xr.global_ordinal()
@@ -302,7 +333,7 @@ def _resume_if_available(cfg: TrainConfig, model, optimizer, scheduler, ckpt_dir
 
 def train(cfg: TrainConfig) -> dict:
     """Run training loop. Returns final metrics."""
-    global _save_requested
+    global _save_requested, _spmd_mesh
     _save_requested = False
     # signal handlers can only be registered on the main thread; xmp.spawn runs each
     # replica in a per-device thread, so skip (SIGUSR1 save is single-process only).
@@ -314,6 +345,18 @@ def train(cfg: TrainConfig) -> dict:
     is_tpu = HAS_XLA and device.type == "xla"
     if device.type == "cuda":
         torch.cuda.set_device(device)
+
+    _spmd_mesh = None
+    if is_tpu:
+        import torch_xla.runtime as xr
+        if xr.is_spmd():
+            _spmd_mesh = _init_spmd_mesh()
+            n_chips = _spmd_mesh.size()
+            if cfg.batch_size % n_chips:
+                raise ValueError(f"tpu_spmd: batch_size {cfg.batch_size} is the global micro-batch "
+                                 f"and must divide by the {n_chips} chips.")
+            print(f"SPMD: 1 process over {n_chips} chips, batch {cfg.batch_size} "
+                  f"({cfg.batch_size // n_chips}/chip) sharded on the 'data' axis.")
 
     # Data-parallel topology (multi-core TPU via torch_xla; single otherwise)
     world_size, ordinal = _setup_topology(is_tpu)
@@ -452,8 +495,8 @@ def train(cfg: TrainConfig) -> dict:
                     data_iter = iter(train_loader)
                     batch = next(data_iter)
 
-                input_ids = batch["input_ids"].to(device)
-                labels = batch["labels"].to(device)
+                input_ids = _to_device(batch["input_ids"], device)
+                labels = _to_device(batch["labels"], device)
 
                 # DDP: only all-reduce grads on the final micro-step of the accumulation.
                 _sync = (micro_step == accum_steps - 1)
@@ -638,6 +681,14 @@ def train_multicore(cfg: TrainConfig) -> None:
     """
     import os
 
+    if os.environ.get("AION_TPU_WORKER") == "1" and getattr(cfg, "tpu_spmd", False):
+        # One process, one compile for all chips. xmp.spawn's 8 processes each compile the
+        # full 235M fwd+bwd graph at once, and that host-RAM spike is the BrokenProcessPool.
+        import torch_xla.runtime as xr
+        xr.use_spmd()  # must precede any XLA device use — hence the fresh subprocess
+        train(cfg)
+        return
+
     if os.environ.get("AION_TPU_WORKER") == "1":
         import torch_xla.distributed.xla_multiprocessing as xmp
         _prebuild_text_cache(cfg)  # avoid concurrent memmap cache writes (SIGBUS)
@@ -723,8 +774,8 @@ def evaluate(model, loader: DataLoader, device: torch.device, max_batches: int =
     n = 0       # batches consumed — still capped by max_batches, so every eval scores the same slice
     scored = 0  # batches that had supervised tokens
     for batch in loader:
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
+        input_ids = _to_device(batch["input_ids"], device)
+        labels = _to_device(batch["labels"], device)
         logits = model(input_ids)
         loss, n_tok = _masked_ce(logits, labels)
         loss, n_tok = torch.stack([loss.float(), n_tok.float()]).tolist()  # one host sync
@@ -744,7 +795,12 @@ def evaluate(model, loader: DataLoader, device: torch.device, max_batches: int =
 
 def _write_ckpt(ckpt: dict, path: Path, is_tpu: bool) -> None:
     """Serialize a checkpoint. On TPU use xm.save (all cores must call it; only master writes)."""
-    if is_tpu:
+    if is_tpu and _spmd_mesh is not None:
+        # SPMD is one process, so there is no cross-core rendezvous to join; copy the
+        # (replicated) device tensors to CPU and save like any single-process run.
+        from torch.utils._pytree import tree_map
+        torch.save(tree_map(lambda v: v.cpu() if isinstance(v, torch.Tensor) else v, ckpt), path)
+    elif is_tpu:
         xm.save(ckpt, str(path))
     else:
         torch.save(ckpt, path)

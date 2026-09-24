@@ -1,0 +1,50 @@
+# Transformer LARGE (~235M) on ALL 8 chips of a Kaggle TPU v5e-8 via SPMD.
+# Same model, LR schedule and effective batch (64) as transformer_tpu_large.yaml, so it
+# resumes that run's latest.pt as a straight continuation. The difference is the launch:
+# one process drives every chip (tpu_spmd) and shards each micro-batch across them,
+# instead of 8 xmp.spawn processes that each compile the graph (BrokenProcessPool).
+# Per-chip batch stays 2, the proven HBM-safe size, so accumulation drops 32 -> 4.
+model_type: transformer
+vocab_size: 16384
+d_model: 1024
+n_layers: 16
+n_heads: 16
+seq_len: 1024
+dropout: 0.0  # single-pass pretraining (no repeated data): dropout only slows learning. Chat configs keep 0.1.
+tie_embeddings: false  # torch_xla physically unties on TPU; declare it so GPU-side resume/generate loads the separate lm_head instead of collapsing it onto the embedding
+
+dataset_type: text
+train_path: ""
+val_path: ""
+tokenizer_path: ""
+instruction_data: ""
+
+# Per chip this is the single-core setup: 2 sequences per micro-step (at 4 the compiled
+# step OOMs a v5e chip), graph flushed per micro-step so peak HBM tracks the micro-batch.
+batch_size: 16       # GLOBAL micro-batch: 2 per chip x 8 chips
+grad_accum_steps: 4  # 16 x 4 = eff batch 64, same as the single-core run
+tpu_cores: 0         # all chips
+tpu_spmd: true
+num_workers: 4
+lr: 2.5e-4          # slightly below the 110M peak (3e-4) — bigger model, gentler LR
+weight_decay: 0.01
+max_steps: 72000    # compute-optimal ~4.7B tokens (65,536/step); needs pretrain_xl data so the extra steps don't repeat
+warmup_steps: 1000  # longer warmup helps larger models settle
+lr_decay_steps: 72000  # cosine over the full extended target, not the per-session max_steps
+grad_clip: 1.0
+grad_checkpoint: true  # essential at 235M — bounds HBM to ~1 layer's attention scores
+compile: false
+seed: 42
+
+checkpoint_dir: checkpoints/transformer_tpu_large
+checkpoint_every: 500
+checkpoint_keep_last: 0  # only latest.pt+best.pt on disk (no step_*.pt archives) — the 5B train.bin (10GB) leaves no room for archives on Kaggle's ~20GB disk
+eval_every: 500
+log_every: 50
+max_eval_batches: 20  # x batch 16 = 320 val seqs (single-core scored 40): less noisy, but NOT the
+                      # same slice, so the first SPMD evals can land above or below the old best
+early_stop_patience: 8    # must fit one session: 5000 steps / eval_every 500 = 10 evals,
+                         # and the first resets the counter, so >9 can never fire
+early_stop_min_delta: 0.002  # 0.01 was coarser than the curve past ~12k steps, where val
+                         # improves ~0.002-0.02 per eval — 8 straight sub-0.01 evals would have
+                         # early-stopped at ~20% of the 72k schedule with the LR still near peak.

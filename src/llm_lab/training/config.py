@@ -45,6 +45,10 @@ class TrainConfig:
     gpus: int = 1  # CUDA GPUs to use: 1 = single; 0 = all visible; N = N via DistributedDataParallel
     tpu_cores: int = 1  # TPU cores: 1 = single core (in-process); anything else (0 or 8) fans
     #                     out to EVERY core via xmp.spawn. cli.cmd_train branches on != 1.
+    tpu_spmd: bool = False  # with tpu_cores != 1: ONE process drives every chip via SPMD (one
+    #                         compile, batch sharded on a 'data' mesh axis) instead of one
+    #                         xmp.spawn process per core. batch_size is then the GLOBAL
+    #                         micro-batch and must divide by the chip count.
     foreach_optim: bool = True  # foreach AdamW is faster but allocates temp buffers for ALL params at once (a large transient spike); set False on tight VRAM
     seed: int = 42
 
