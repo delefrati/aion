@@ -1,0 +1,55 @@
+# Continued pretraining of the 235M base on the pretrain_edu mix (FineWeb-Edu + Cosmopedia-v2
+# + replay of the base's sources) on Kaggle T4 x2 GPU. GPU twin of transformer_tpu_large_edu_spmd:
+# same model, LR schedule and step budget; only the launch settings differ (batch 2 x accum 16
+# x 2 GPUs = eff batch 64). The notebook seeds the run from the base's latest.pt at step 0
+# (fresh optimizer + schedule, empty metrics), so warmup/decay count from the phase start.
+# LR re-warms to 1e-4, not the base's 2.5e-4: the weights are already trained.
+model_type: transformer
+d_model: 1024
+n_layers: 16
+n_heads: 16
+vocab_size: 16384
+seq_len: 1024
+dropout: 0.0  # single-pass pretraining (no repeated data): dropout only slows learning. Chat configs keep 0.1.
+
+batch_size: 2
+grad_accum_steps: 32
+grad_checkpoint: true
+grad_clip: 1.0
+compile: false
+
+lr: 1.0e-4             # re-warm peak (base peaked at 2.5e-4)
+warmup_steps: 500
+lr_decay_steps: 20000  # cosine over the whole phase, not the per-session max_steps
+weight_decay: 0.01
+use_8bit_optim: false  # TPU checkpoint used standard AdamW; match it so optimizer state resumes cleanly
+tie_embeddings: false  # torch_xla broke the lm_head/embedding tie on TPU, so the checkpoint is UNTIED (235M); build untied here to match
+gpus: 1                # single GPU — the safe default for launchers that read this config
+                       # directly. The Kaggle notebook's USE_BOTH_GPUS overrides it to 0, and
+                       # 2x T4 DDP does work: 5.88s/step sustained over a full 8h session, once
+                       # Cell 2 frees its own copy of the ckpt so both ranks can load it
+                       # without OOMing the ~13GB host. Set 0 here to opt into DDP directly.
+
+max_steps: 20000       # ~1.3B tokens (65,536/step); pretrain_edu holds ~2B, so no repeats
+eval_every: 500
+checkpoint_every: 500
+checkpoint_keep_last: 0  # only latest.pt+best.pt on disk — Kaggle GPU shares the ~20GB /tmp wall and the 5B (10GB) tokenized cache; harmless on Colab (checkpoints go to Drive)
+log_every: 50
+max_eval_batches: 20
+early_stop_patience: 8   # must fit one session: 5000 steps / eval_every 500 = 10 evals, and the
+                         # first resets the counter, so anything >9 can never fire (patience is
+                         # per-session by design — see early_stop_best in trainer.py)
+early_stop_min_delta: 0.002  # 0.01 was coarser than the curve past ~12k steps, where val
+                         # improves ~0.002-0.02 per eval — 8 straight sub-0.01 evals would have
+                         # early-stopped at ~20% of the 72k schedule with the LR still near peak.
+
+num_workers: 0         # in-process data loading — fewer host procs (memmap needs no copy)
+foreach_optim: false   # avoid the foreach-AdamW transient spike that OOMs the T4 at step 1
+seed: 42
+
+dataset_type: text
+train_path: /tmp/data/train.txt
+val_path: /tmp/data/val.txt
+tokenizer_path: /tmp/data/tokenizer.json
+instruction_data: ''
+checkpoint_dir: /tmp/checkpoints
