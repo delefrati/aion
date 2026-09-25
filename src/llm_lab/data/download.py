@@ -95,6 +95,61 @@ def download_slimpajama_subset(out_dir: Path, target_mb: int = 80) -> Path:
     return out_path
 
 
+def _download_parquet_text(out_path: Path, repo: str, data_files: str, target_mb: int,
+                           desc: str, keep=None) -> Path:
+    """Stream the `text` column of a parquet-sharded HF dataset into a .txt corpus.
+
+    `data_files` names the shards directly: letting `datasets` resolve these multi-TB repos
+    lists every file first, which takes minutes before the first row arrives.
+    """
+    from datasets import load_dataset
+
+    if out_path.exists():
+        size_mb = out_path.stat().st_size / 1024 / 1024
+        print(f"{desc} already exists ({size_mb:.1f} MB), skipping")
+        return out_path
+
+    print(f"Downloading {desc} (~{target_mb} MB)...")
+    target_bytes = target_mb * 1024 * 1024
+    total_bytes = 0
+    kept = skipped = 0
+    ds = load_dataset(repo, data_files=data_files, split="train", streaming=True)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        for example in tqdm(ds, desc=desc):
+            text = (example.get("text") or "").strip()
+            if len(text) < 200 or (keep is not None and not keep(example)):
+                skipped += 1
+                continue
+            f.write(text + "\n\n")
+            kept += 1
+            total_bytes += len(text.encode("utf-8"))
+            if total_bytes >= target_bytes:
+                break
+
+    size_mb = out_path.stat().st_size / 1024 / 1024
+    print(f"Saved: {out_path} ({size_mb:.1f} MB) — kept {kept:,}, skipped {skipped:,}")
+    return out_path
+
+
+def download_fineweb_edu(out_dir: Path, target_mb: int = 5000, min_int_score: int = 3) -> Path:
+    """FineWeb-Edu (sample-10BT): web pages an LLM classifier rated as educational.
+
+    The dataset is already cut at int_score >= 3; raise `min_int_score` to 4 for the
+    stricter, smaller slice.
+    """
+    keep = None if min_int_score <= 3 else (lambda ex: int(ex.get("int_score") or 0) >= min_int_score)
+    return _download_parquet_text(out_dir / "fineweb_edu.txt", "HuggingFaceFW/fineweb-edu",
+                                  "sample/10BT/*.parquet", target_mb, "FineWeb-Edu", keep)
+
+
+def download_cosmopedia(out_dir: Path, target_mb: int = 1700) -> Path:
+    """Cosmopedia v2 (from smollm-corpus): synthetic textbooks, stories and explanations."""
+    return _download_parquet_text(out_dir / "cosmopedia_v2.txt", "HuggingFaceTB/smollm-corpus",
+                                  "cosmopedia-v2/*.parquet", target_mb, "Cosmopedia-v2")
+
+
 def download_dolly15k(out_dir: Path) -> Path:
     """Download databricks-dolly-15k instruction dataset."""
     from datasets import load_dataset
@@ -478,6 +533,11 @@ PRESETS = {
     # you extend past 50k without re-seeing data. Fold it in via the notebook's ADD_DATA path so
     # val.bin + tokenizer stay frozen (losses stay comparable to the current run).
     "pretrain_xl": {"wikipedia_mb": 2000, "slimpajama_mb": 18000, "dolly": False, "no_robots": False, "guanaco": False, "hh_rlhf": False},
+    # Continued-pretraining phase for the 235M base (~8.4GB ≈ 2B tokens, enough for the
+    # 20k-step x 65,536-token phase without repeats): ~60% FineWeb-Edu, ~20% Cosmopedia-v2,
+    # ~20% replay of the base's own sources so the shift doesn't erase what it knows.
+    "pretrain_edu": {"fineweb_edu_mb": 5000, "cosmopedia_mb": 1700, "wikipedia_mb": 700, "slimpajama_mb": 1000,
+                     "dolly": False, "no_robots": False, "guanaco": False, "hh_rlhf": False},
 }
 
 
@@ -495,6 +555,10 @@ def main():
     print()
 
     # Pretraining data
+    if preset.get("fineweb_edu_mb", 0) > 0:
+        download_fineweb_edu(out_dir, target_mb=preset["fineweb_edu_mb"])
+    if preset.get("cosmopedia_mb", 0) > 0:
+        download_cosmopedia(out_dir, target_mb=preset["cosmopedia_mb"])
     if preset.get("wikipedia_mb", 0) > 0:
         download_wikipedia(out_dir, target_mb=preset["wikipedia_mb"])
     if preset["slimpajama_mb"] > 0:

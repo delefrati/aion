@@ -39,14 +39,15 @@ def _list_files(slug):
     return (files if seen_header else None), out
 
 
-def download_dataset(slug, dest, required=("latest.pt",), attempts=6, wait=20):
-    """Download every file of `slug` into `dest`.
+def download_dataset(slug, dest, required=("latest.pt",), attempts=6, wait=20, only=None):
+    """Download every file of `slug` into `dest` (or just the names in `only`).
 
     Returns the list of file names restored, or None if the Dataset does not exist.
     Raises RuntimeError if the Dataset lacks a file in `required`, or if ANY file fails
     `attempts` times (a single file can 404 transiently). Every file is mandatory because
     the checkpoint notebooks push `dest` back as the next version: a file skipped here
-    would be silently dropped from the Dataset.
+    would be silently dropped from the Dataset. Pass `only` solely when reading from a
+    Dataset this caller never pushes back.
     """
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
@@ -67,6 +68,8 @@ def download_dataset(slug, dest, required=("latest.pt",), attempts=6, wait=20):
     if missing:
         raise RuntimeError(f"{slug} has no {missing} (files: {sorted(files)}). Is the Dataset populated?")
 
+    if only is not None:
+        files = {n: s for n, s in files.items() if n in only}
     restored = []
     for name, size in files.items():
         path = dest / name

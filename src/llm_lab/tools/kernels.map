@@ -9,5 +9,7 @@ kaggle_chat_gpu_large.ipynb            kaggle-chat-gpu-large
 kaggle_pretrain_gpu_large.ipynb        kaggle-pretrain-gpu-large
 kaggle_pretrain_tpu.ipynb              kaggle-pretrain-tpu-ipynb
 kaggle_pretrain_medium.ipynb           kaggle-pretrain-medium
+kaggle_bench_gpu.ipynb                 kaggle-bench-gpu
+kaggle_build_edu_cache.ipynb           kaggle-build-edu-cache
 kaggle_chat_multisession_medium.ipynb  REPLACE-ME
 kaggle_chat_tpu.ipynb                  REPLACE-ME

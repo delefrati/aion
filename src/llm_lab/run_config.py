@@ -10,6 +10,7 @@ overfitting overshoot, lives here.
 # name -> total target steps (the hard cap the notebook stops at)
 BUDGETS = {
     "pretrain_large": 72000,       # 235M base: compute-optimal ~4.7B tokens (needs pretrain_xl data to avoid repeats)
+    "pretrain_large_edu": 20000,   # 235M continued pretraining on pretrain_edu (~1.3B of its ~2B tokens)
     "pretrain_medium": 20000,      # 110M base pretrain
     "pretrain_tpu_medium": 40000,  # 110M TPU continue (20k->40k warm restart)
     # 235M chat finetune. The old 8000 cap was the knee for a ~94k-example corpus (~2.6k
@@ -34,6 +35,7 @@ def budget(name: str) -> int:
 # enlarged pretrain_xl (~5B tokens) so its extended 72k-step run sees new data, not repeats.
 DATA_PRESETS = {
     "pretrain_large": "pretrain_xl",
+    "pretrain_large_edu": "pretrain_edu",  # built off-device by tools/build_edu_cache.py
     "pretrain_medium": "pretrain",
     "pretrain_tpu_medium": "pretrain",
 }

@@ -57,7 +57,9 @@ class LocalMambaProvider(BaseProvider):
         # Trained context window; total (prompt + generated) must stay within this
         self.context_len = getattr(cfg, "seq_len", self.max_tokens)
         self.history_turns = settings.mamba_history_turns
-        self.temperature = 0.8   # conversational temperature; 0.3 was too deterministic
+        # 0.8 made the 235M chat model bury facts it knows (it named Paris only at low T);
+        # 0.3 read as too deterministic. 0.4 keeps the facts and some variety.
+        self.temperature = 0.4
 
     @staticmethod
     def _resolve_checkpoint_path(model_path: str) -> str:
