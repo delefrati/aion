@@ -28,6 +28,7 @@ def build_model(cfg: TrainConfig):
             use_grad_checkpoint=cfg.grad_checkpoint,
             tie_embeddings=getattr(cfg, "tie_embeddings", True),
             dropout=cfg.dropout,
+            flash_attention=getattr(cfg, "flash_attention", False),
         )
     else:
         raise ValueError(f"Unknown model_type: {cfg.model_type}")

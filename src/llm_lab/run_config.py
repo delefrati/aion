@@ -11,6 +11,9 @@ overfitting overshoot, lives here.
 BUDGETS = {
     "pretrain_large": 72000,       # 235M base: compute-optimal ~4.7B tokens (needs pretrain_xl data to avoid repeats)
     "pretrain_large_edu": 20000,   # 235M continued pretraining on pretrain_edu (~1.3B of its ~2B tokens)
+    # Second phase on pretrain_edu x5 (~10B tokens) at 131k tokens/step: ~9.2B tokens, no repeats.
+    # WSD schedule, so while the LR is still flat this can be raised to extend the run.
+    "pretrain_large_edu2": 70000,
     "pretrain_medium": 20000,      # 110M base pretrain
     "pretrain_tpu_medium": 40000,  # 110M TPU continue (20k->40k warm restart)
     # 235M chat finetune. The old 8000 cap was the knee for a ~94k-example corpus (~2.6k
@@ -36,6 +39,7 @@ def budget(name: str) -> int:
 DATA_PRESETS = {
     "pretrain_large": "pretrain_xl",
     "pretrain_large_edu": "pretrain_edu",  # built off-device by tools/build_edu_cache.py
+    "pretrain_large_edu2": "pretrain_edu",  # same builder at --scale 5
     "pretrain_medium": "pretrain",
     "pretrain_tpu_medium": "pretrain",
 }

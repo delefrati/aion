@@ -61,28 +61,91 @@ def _autocast_context(is_tpu: bool, use_amp: bool):
     return contextlib.nullcontext()
 
 
-def _init_spmd_mesh():
-    """Build a 1-D 'data' mesh over every TPU chip for the SPMD path (xr.use_spmd() done)."""
+def _init_spmd_mesh(fsdp: bool = False):
+    """Build the device mesh over every TPU chip for the SPMD path (xr.use_spmd() done).
+
+    Plain data parallelism uses a 1-D 'data' axis. FSDPv2 insists on an axis named 'fsdp';
+    the (n, 1) shape is the layout its docs use. Either way the batch shards on axis 0, and
+    the mesh is made global so the flash-attention kernel can find it.
+    """
     import numpy as np
     import torch_xla.distributed.spmd as xs
     import torch_xla.runtime as xr
     n = xr.global_runtime_device_count()
-    return xs.Mesh(np.arange(n), (n,), ("data",))
+    if fsdp:
+        mesh = xs.Mesh(np.arange(n), (n, 1), ("fsdp", "model"))
+    else:
+        mesh = xs.Mesh(np.arange(n), (n,), ("data",))
+    xs.set_global_mesh(mesh)
+    return mesh
 
 
 def _to_device(t: torch.Tensor, device) -> torch.Tensor:
     """Move a [batch, ...] tensor to device; under SPMD, shard its batch dim across chips.
 
-    Params stay replicated (unannotated), so sharding only the inputs makes this plain data
-    parallelism: the SPMD partitioner inserts the gradient all-reduce itself. A batch that
-    doesn't divide by the chip count (a chat val tail) is left replicated rather than
-    unevenly sharded — every chip then computes it in full, which is correct, just slower.
+    Without tpu_fsdp, params stay replicated (unannotated), so sharding only the inputs makes
+    this plain data parallelism: the SPMD partitioner inserts the gradient all-reduce itself.
+    A batch that doesn't divide by the chip count (a chat val tail) is left replicated rather
+    than unevenly sharded — every chip then computes it in full, which is correct, just slower.
     """
     t = t.to(device)
     if _spmd_mesh is not None and t.size(0) % _spmd_mesh.size() == 0:
         import torch_xla.distributed.spmd as xs
-        xs.mark_sharding(t, _spmd_mesh, ("data",) + (None,) * (t.dim() - 1))
+        xs.mark_sharding(t, _spmd_mesh, (_spmd_mesh.axis_names[0],) + (None,) * (t.dim() - 1))
     return t
+
+
+def _fsdp_wrap(model, optimizer, is_master: bool):
+    """Shard params (FSDPv2, one wrap per transformer block) and the optimizer state over chips.
+
+    Runs after resume, so weights and optimizer moments were loaded into the plain module.
+    FSDPv2 annotates the existing Parameters in place, so the optimizer keeps pointing at the
+    right tensors; checked below, since a silent mismatch would train nothing.
+    """
+    import functools
+    from torch_xla.distributed.fsdp.wrap import transformer_auto_wrap_policy
+    from torch_xla.experimental.spmd_fully_sharded_data_parallel import (
+        SpmdFullyShardedDataParallel as FSDPv2,
+    )
+    from llm_lab.models.transformer_lm import TransformerBlock
+
+    before = [p for g in optimizer.param_groups for p in g["params"]]
+    policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={TransformerBlock})
+    model = FSDPv2(model, auto_wrap_policy=policy)
+    after = set(id(p) for p in model.parameters())
+    if any(id(p) not in after for p in before):
+        raise RuntimeError("tpu_fsdp: FSDPv2 replaced the parameters; the optimizer would update "
+                           "tensors the model no longer uses.")
+    _shard_optimizer_state(optimizer, is_master)
+    if is_master:
+        tqdm.write("FSDPv2: params, grads and optimizer state sharded over the 'fsdp' axis.")
+    return model
+
+
+def _shard_optimizer_state(optimizer, is_master: bool) -> None:
+    """Give each param-shaped optimizer tensor (Adam moments) the param's dim-0 sharding.
+
+    Moments restored from a checkpoint arrive replicated. Fresh ones don't exist until the
+    first step, so this runs again after it. The partitioner would likely shard them anyway;
+    this makes it explicit.
+    """
+    import torch_xla.distributed.spmd as xs
+    axis = _spmd_mesh.axis_names[0]
+    n = 0
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            for v in optimizer.state.get(p, {}).values():
+                if isinstance(v, torch.Tensor) and v.device.type == "xla" and v.dim() >= 1 \
+                        and v.shape == p.shape:
+                    try:
+                        xs.mark_sharding(v, _spmd_mesh, (axis,) + (None,) * (v.dim() - 1))
+                        n += 1
+                    except Exception as e:  # already sharded, or an API difference
+                        if is_master:
+                            tqdm.write(f"tpu_fsdp: optimizer state left as is ({e})")
+                        return
+    if is_master and n:
+        tqdm.write(f"tpu_fsdp: sharded {n} optimizer state tensors.")
 
 
 def _masked_ce(logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -121,9 +184,56 @@ def _get_curriculum_seq_len(stages: list[tuple[int, int]], step: int, default: i
     return default
 
 
+# Tag on val entries scored by _text_val_dataset. Earlier text runs scored overlapping windows
+# at the head of val.bin (~1.3k distinct tokens), so their val_loss is not comparable.
+TEXT_VAL_METRIC = "spread"
+
+
+def _text_val_dataset(path, tokenizer, seq_len: int, n_windows: int):
+    """Val set for text runs: non-overlapping windows spread evenly over the whole file.
+
+    The file is written source by source, so the head of it is one source (and with stride 1,
+    one document). n_windows evenly spaced windows sample every source in proportion;
+    0 (or more than the file holds) keeps all of them.
+    """
+    from torch.utils.data import Subset
+    ds = TextDataset(path, tokenizer, seq_len, stride=seq_len)
+    total = len(ds)
+    if n_windows <= 0 or n_windows >= total:
+        return ds
+    return Subset(ds, [i * total // n_windows for i in range(n_windows)])
+
+
+def _val_loader(val_ds, batch_size, num_workers, distributed, world_size, ordinal, drop_last,
+                pin, collate_fn, is_tpu, device):
+    sampler = None
+    if distributed:
+        from torch.utils.data.distributed import DistributedSampler
+        sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=ordinal,
+                                     shuffle=False, drop_last=drop_last)
+    loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, sampler=sampler, drop_last=drop_last,
+        num_workers=max(0, num_workers - 1), pin_memory=pin, collate_fn=collate_fn,
+    )
+    if is_tpu and distributed:
+        from torch_xla.distributed.parallel_loader import MpDeviceLoader
+        loader = MpDeviceLoader(loader, device)
+    return loader
+
+
+def _make_old_val_loader(val_old_path, tokenizer, seq_len, batch_size, max_eval_batches: int,
+                         num_workers: int = 2, world_size: int = 1, ordinal: int = 0,
+                         is_tpu: bool = False, device=None):
+    """Loader for the optional second text val set (cfg.val_old_path), scored like val."""
+    ds = _text_val_dataset(val_old_path, tokenizer, seq_len, max_eval_batches * batch_size * world_size)
+    return _val_loader(ds, batch_size, num_workers, world_size > 1, world_size, ordinal, True,
+                       num_workers > 0 and not is_tpu, None, is_tpu, device)
+
+
 def _make_loaders(train_path, val_path, tokenizer, seq_len, batch_size, num_workers: int = 2,
                   dataset_type: str = "text", instruction_data: str = "",
-                  world_size: int = 1, ordinal: int = 0, is_tpu: bool = False, device=None):
+                  world_size: int = 1, ordinal: int = 0, is_tpu: bool = False, device=None,
+                  max_eval_batches: int = 0):
     """Build train and val dataloaders for a given seq_len.
 
     When world_size > 1, each replica gets a DistributedSampler shard and the
@@ -155,7 +265,8 @@ def _make_loaders(train_path, val_path, tokenizer, seq_len, batch_size, num_work
         val_drop_last = False
     else:
         train_ds = TextDataset(train_path, tokenizer, seq_len)
-        val_ds = TextDataset(val_path, tokenizer, seq_len)
+        # Every replica consumes up to max_eval_batches of its DistributedSampler shard.
+        val_ds = _text_val_dataset(val_path, tokenizer, seq_len, max_eval_batches * batch_size * world_size)
         collate_fn = None
         val_drop_last = True
 
@@ -169,13 +280,10 @@ def _make_loaders(train_path, val_path, tokenizer, seq_len, batch_size, num_work
         _g.manual_seed(1234 + ordinal)
         n_samples = min(len(train_ds), 2_000_000)
         train_sampler = RandomSampler(train_ds, replacement=True, num_samples=n_samples, generator=_g)
-        val_sampler = None  # eval is capped by max_eval_batches; every rank scores the same slice
     elif distributed:
         from torch.utils.data.distributed import DistributedSampler
         train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=ordinal,
                                            shuffle=True, drop_last=True)
-        val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=ordinal,
-                                         shuffle=False, drop_last=val_drop_last)
     elif is_text:
         # A plain shuffle=True builds torch.randperm(len(dataset)); for the token corpus
         # len can be billions -> a tens-of-GB tensor that OOMs small GPU hosts (fine on the
@@ -185,23 +293,21 @@ def _make_loaders(train_path, val_path, tokenizer, seq_len, batch_size, num_work
         from torch.utils.data import RandomSampler
         n_samples = min(len(train_ds), 2_000_000)
         train_sampler = RandomSampler(train_ds, replacement=True, num_samples=n_samples)
-        val_sampler = None
     else:
-        train_sampler = val_sampler = None
+        train_sampler = None
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=(train_sampler is None), sampler=train_sampler,
         drop_last=True, num_workers=num_workers, pin_memory=pin, collate_fn=collate_fn,
     )
-    val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, sampler=val_sampler, drop_last=val_drop_last,
-        num_workers=max(0, num_workers - 1), pin_memory=pin, collate_fn=collate_fn,
-    )
+    # Distributed runs shard val across replicas (the text val set is sized for all of them)
+    # and average the per-replica losses afterwards.
+    val_loader = _val_loader(val_ds, batch_size, num_workers, distributed, world_size, ordinal,
+                             val_drop_last, pin, collate_fn, is_tpu, device)
 
     if is_tpu and distributed:
         from torch_xla.distributed.parallel_loader import MpDeviceLoader
         train_loader = MpDeviceLoader(train_loader, device)
-        val_loader = MpDeviceLoader(val_loader, device)
 
     return train_loader, val_loader
 
@@ -231,6 +337,21 @@ def _reduce_mean(value: float, is_tpu: bool, device) -> float:
     return (t / dist.get_world_size()).item()
 
 
+def _hbm_note(device, is_tpu: bool) -> str:
+    """' | hbm used/total GB' for the log line on TPU; '' when the runtime won't say."""
+    if not is_tpu:
+        return ""
+    try:
+        info = xm.get_memory_info(device)
+        if "bytes_used" in info:
+            used, total = info["bytes_used"], info["bytes_limit"]
+        else:  # older torch_xla
+            used, total = (info["kb_total"] - info["kb_free"]) * 1024, info["kb_total"] * 1024
+        return f" | hbm {used / 2**30:.1f}/{total / 2**30:.1f}GB"
+    except Exception:
+        return ""
+
+
 def _build_optimizer(cfg: TrainConfig, model, device: torch.device, is_master: bool):
     """8-bit AdamW when bitsandbytes is available (saves ~280MB), else foreach/standard AdamW."""
     try:
@@ -254,17 +375,33 @@ def _build_optimizer(cfg: TrainConfig, model, device: torch.device, is_master: b
 
 
 def _make_scheduler(cfg: TrainConfig, optimizer):
-    """Linear warmup then cosine decay toward lr_decay_steps.
+    """Linear warmup, then cosine decay toward lr_decay_steps, or (lr_schedule='wsd') a flat
+    LR until the last wsd_decay_steps before lr_decay_steps and a 1-sqrt decay to 0 over them.
 
     Decays toward the FULL training target (lr_decay_steps), not the per-session
     max_steps — otherwise the LR would hit 0 at every session end (each session sets
-    max_steps = steps_done + steps_this_session).
+    max_steps = steps_done + steps_this_session). The lambda is rebuilt from the config
+    every session (LambdaLR doesn't save it), so a WSD run still in its flat part extends
+    just by raising lr_decay_steps.
     """
     lr_decay_steps = getattr(cfg, "lr_decay_steps", 0) or cfg.max_steps
+    schedule = getattr(cfg, "lr_schedule", "cosine")
+    if schedule not in ("cosine", "wsd"):
+        raise ValueError(f"lr_schedule must be 'cosine' or 'wsd', got {schedule!r}")
+    decay_len = getattr(cfg, "wsd_decay_steps", 0)
+    if schedule == "wsd" and not 0 < decay_len <= lr_decay_steps - cfg.warmup_steps:
+        raise ValueError(f"wsd needs 0 < wsd_decay_steps ({decay_len}) <= lr_decay_steps - "
+                         f"warmup_steps ({lr_decay_steps - cfg.warmup_steps}).")
+    decay_start = lr_decay_steps - decay_len
 
     def lr_lambda(step: int) -> float:
         if step < cfg.warmup_steps:
             return step / max(1, cfg.warmup_steps)
+        if schedule == "wsd":
+            if step < decay_start:
+                return 1.0
+            # 1-sqrt cooldown (Hägele et al. 2024): matches cosine at equal compute.
+            return max(0.0, 1.0 - math.sqrt(min(1.0, (step - decay_start) / decay_len)))
         progress = (step - cfg.warmup_steps) / max(1, lr_decay_steps - cfg.warmup_steps)
         progress = min(1.0, max(0.0, progress))
         return 0.5 * (1 + math.cos(math.pi * progress))
@@ -347,16 +484,21 @@ def train(cfg: TrainConfig) -> dict:
         torch.cuda.set_device(device)
 
     _spmd_mesh = None
+    use_fsdp = bool(getattr(cfg, "tpu_fsdp", False))
     if is_tpu:
         import torch_xla.runtime as xr
+        if use_fsdp and not xr.is_spmd():
+            raise ValueError("tpu_fsdp needs tpu_spmd (one SPMD process over every chip).")
         if xr.is_spmd():
-            _spmd_mesh = _init_spmd_mesh()
+            _spmd_mesh = _init_spmd_mesh(fsdp=use_fsdp)
             n_chips = _spmd_mesh.size()
             if cfg.batch_size % n_chips:
                 raise ValueError(f"tpu_spmd: batch_size {cfg.batch_size} is the global micro-batch "
                                  f"and must divide by the {n_chips} chips.")
             print(f"SPMD: 1 process over {n_chips} chips, batch {cfg.batch_size} "
-                  f"({cfg.batch_size // n_chips}/chip) sharded on the 'data' axis.")
+                  f"({cfg.batch_size // n_chips}/chip) sharded on the '{_spmd_mesh.axis_names[0]}' axis.")
+    elif use_fsdp:
+        raise ValueError("tpu_fsdp is TPU-only.")
 
     # Data-parallel topology (multi-core TPU via torch_xla; single otherwise)
     world_size, ordinal = _setup_topology(is_tpu)
@@ -390,7 +532,18 @@ def train(cfg: TrainConfig) -> dict:
         dataset_type=dataset_type,
         instruction_data=instruction_data,
         world_size=world_size, ordinal=ordinal, is_tpu=is_tpu, device=device,
+        max_eval_batches=cfg.max_eval_batches,
     )
+    val_old_path = getattr(cfg, "val_old_path", "")
+    if val_old_path and dataset_type != "text":
+        raise ValueError("val_old_path is for text runs only.")
+    val_old_loader = None
+    if val_old_path:
+        val_old_loader = _make_old_val_loader(
+            Path(val_old_path), tokenizer, cfg.seq_len, cfg.batch_size, cfg.max_eval_batches,
+            getattr(cfg, "num_workers", 2), world_size=world_size, ordinal=ordinal,
+            is_tpu=is_tpu, device=device,
+        )
 
     model = build_model(cfg).to(device)
     param_count = sum(p.numel() for p in model.parameters())
@@ -421,14 +574,24 @@ def train(cfg: TrainConfig) -> dict:
         cfg, model, optimizer, scheduler, ckpt_dir, device, is_master
     )
 
+    if use_fsdp:
+        model = _fsdp_wrap(model, optimizer, is_master)
+
     if getattr(cfg, "compile", False):
         model = torch.compile(model)
         if is_master:
             tqdm.write("torch.compile enabled (first step will be slow — JIT compiling kernels)")
 
+    # Text val entries carry a metric tag; only same-metric history may set the best to beat,
+    # or a resumed run would compare its loss against the old one-document number.
+    val_metric = TEXT_VAL_METRIC if dataset_type == "text" else None
+
+    def _comparable(entry: dict) -> bool:
+        return "val_loss" in entry and entry.get("val_metric") == val_metric
+
     # Keep track of best validation from prior history for persistent best.pt updates
     for entry in metrics_log:
-        if "val_loss" in entry and entry["val_loss"] < best_val_loss:
+        if _comparable(entry) and entry["val_loss"] < best_val_loss:
             best_val_loss = entry["val_loss"]
             best_step = entry["step"]
 
@@ -465,6 +628,18 @@ def train(cfg: TrainConfig) -> dict:
     effective_batch = cfg.batch_size * accum_steps * world_size
     if accum_steps > 1 and is_master:
         tqdm.write(f"Gradient accumulation: {accum_steps} steps (effective batch={effective_batch})")
+    fuse_step = is_tpu and getattr(cfg, "tpu_fuse_step", False)
+    tokens_per_step = effective_batch * cfg.seq_len
+
+    # Wall-clock session cap. Each rank would read its own clock, so multi-process runs (xmp,
+    # DDP) could disagree on the stopping step and deadlock; only one-process runs get it.
+    max_minutes = getattr(cfg, "max_train_minutes", 0) or 0
+    if max_minutes > 0 and world_size > 1:
+        if is_master:
+            tqdm.write("max_train_minutes ignored: multi-process run.")
+        max_minutes = 0
+    end_step = cfg.max_steps
+    t_log, step_log = time.time(), start_step
 
     for step in tqdm(range(start_step, cfg.max_steps), initial=start_step, total=cfg.max_steps,
                      dynamic_ncols=True, disable=not is_master):
@@ -480,6 +655,7 @@ def train(cfg: TrainConfig) -> dict:
                         dataset_type=dataset_type,
                         instruction_data=instruction_data,
                         world_size=world_size, ordinal=ordinal, is_tpu=is_tpu, device=device,
+                        max_eval_batches=cfg.max_eval_batches,
                     )
                     data_iter = iter(train_loader)
                     if is_master:
@@ -514,7 +690,9 @@ def train(cfg: TrainConfig) -> dict:
                         # Flush each micro-step so the lazy XLA graph spans ONE microbatch,
                         # not all accum_steps — grads persist in .grad across mark_step, so
                         # peak HBM stays ~batch (not batch*accum, which OOMs at 235M).
-                        xm.mark_step()
+                        # tpu_fuse_step leaves the last one to the optimizer step's flush.
+                        if not (fuse_step and _sync):
+                            xm.mark_step()
                     else:
                         scaler.scale(loss).backward()
 
@@ -533,23 +711,31 @@ def train(cfg: TrainConfig) -> dict:
                 scaler.step(optimizer)
                 scaler.update()
             scheduler.step()
+            if use_fsdp and step == start_step:
+                _shard_optimizer_state(optimizer, is_master)  # fresh moments exist only now
 
             # Re-scale loss for logging (undo the /accum_steps)
             loss = loss * accum_steps
 
             # logging
             if (step + 1) % cfg.log_every == 0 and is_master:
-                elapsed = time.time() - t0
+                train_loss = loss.item()  # host sync: the step's work is done after this
+                now = time.time()
+                elapsed = now - t0
+                tok_s = (step + 1 - step_log) * tokens_per_step / max(now - t_log, 1e-6)
+                t_log, step_log = now, step + 1
                 entry = {
                     "step": step + 1,
-                    "train_loss": loss.item(),
+                    "train_loss": train_loss,
                     "lr": scheduler.get_last_lr()[0],
                     "elapsed_s": round(elapsed, 1),
+                    "tok_s": round(tok_s),
                 }
                 metrics_log.append(entry)
                 tqdm.write(
                     f"step {entry['step']:>5d} | loss {entry['train_loss']:.4f} | "
-                    f"lr {entry['lr']:.2e} | {elapsed:.0f}s"
+                    f"lr {entry['lr']:.2e} | {elapsed:.0f}s | {tok_s / 1e3:.1f}k tok/s"
+                    + _hbm_note(device, is_tpu)
                 )
 
             # eval — every core evaluates its shard, then we average across cores
@@ -558,9 +744,18 @@ def train(cfg: TrainConfig) -> dict:
                 if world_size > 1:
                     val_loss = _reduce_mean(val_loss, is_tpu, device)
                 entry = {"step": step + 1, "val_loss": val_loss}
+                if val_metric:
+                    entry["val_metric"] = val_metric
+                note = ""
+                if val_old_loader is not None:
+                    val_old = evaluate(model, val_old_loader, device, cfg.max_eval_batches)
+                    if world_size > 1:
+                        val_old = _reduce_mean(val_old, is_tpu, device)
+                    entry["val_old_loss"] = val_old
+                    note = f" | val_old_loss {val_old:.4f}"
                 metrics_log.append(entry)
                 if is_master:
-                    tqdm.write(f"step {step + 1:>5d} | val_loss {val_loss:.4f}")
+                    tqdm.write(f"step {step + 1:>5d} | val_loss {val_loss:.4f}{note}")
                 min_delta = getattr(cfg, "early_stop_min_delta", 0.0)
                 # best.pt: overwrite on ANY all-time improvement. min_delta is an
                 # early-stopping threshold ("is progress still worth the compute?") and
@@ -620,6 +815,13 @@ def train(cfg: TrainConfig) -> dict:
                     is_master=is_master,
                 )
 
+            if max_minutes > 0 and (time.time() - t0) / 60 >= max_minutes and step + 1 < cfg.max_steps:
+                end_step = step + 1
+                if is_master:
+                    tqdm.write(f"max_train_minutes={max_minutes:g} reached at step {end_step}: "
+                               "stopping this session (the final save below banks it).")
+                break
+
         except KeyboardInterrupt:
             # Multi-core: skip the save (an unsynchronized xm.save would deadlock the other cores)
             if world_size > 1:
@@ -635,7 +837,7 @@ def train(cfg: TrainConfig) -> dict:
     if world_size > 1:
         val_loss = _reduce_mean(val_loss, is_tpu, device)
     if is_tpu or is_master:
-        _save_checkpoint(model, optimizer, scheduler, cfg.max_steps, metrics_log, ckpt_dir, is_tpu=is_tpu, is_master=is_master,
+        _save_checkpoint(model, optimizer, scheduler, end_step, metrics_log, ckpt_dir, is_tpu=is_tpu, is_master=is_master,
                          keep_last=getattr(cfg, "checkpoint_keep_last", 2))
 
     # save metrics
@@ -648,7 +850,7 @@ def train(cfg: TrainConfig) -> dict:
         "best_val_loss": best_val_loss,
         "best_step": best_step,
         "param_count": param_count,
-        "steps": cfg.max_steps,
+        "steps": end_step,
     }
 
 
@@ -807,8 +1009,10 @@ def _write_ckpt(ckpt: dict, path: Path, is_tpu: bool) -> None:
 
 
 def _strip_prefixes(state_dict: dict) -> dict:
-    """Drop DataParallel's 'module.' and torch.compile's '_orig_mod.' key prefixes."""
-    return {k.replace("module.", "").replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    """Drop FSDPv2's '_orig_module.', DataParallel's 'module.' and torch.compile's '_orig_mod.'
+    key prefixes. '_orig_module.' goes first: it contains 'module.'."""
+    return {k.replace("_orig_module.", "").replace("module.", "").replace("_orig_mod.", ""): v
+            for k, v in state_dict.items()}
 
 
 def load_model(cfg: TrainConfig, ckpt_path, device: torch.device):

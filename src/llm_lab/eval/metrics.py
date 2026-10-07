@@ -18,7 +18,7 @@ def perplexity(model, data_path: Path, tokenizer_path: Path, seq_len: int = 256,
     """Compute perplexity on a dataset."""
     device = next(model.parameters()).device
     tokenizer = load_tokenizer(Path(tokenizer_path))
-    ds = TextDataset(data_path, tokenizer, seq_len)
+    ds = TextDataset(data_path, tokenizer, seq_len, stride=seq_len)  # each token scored once
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=True)
 
     model.eval()

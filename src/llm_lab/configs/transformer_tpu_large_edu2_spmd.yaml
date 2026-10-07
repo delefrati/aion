@@ -1,0 +1,54 @@
+# Second continued-pretraining phase of the 235M model: seeded from the edu phase's latest.pt
+# (step 0, fresh optimizer), trained on the ~10B-token pretrain_edu x5 cache
+# (aion-pretrain-edu-xl-tokenized; same mix and val.bin as the edu phase, 5x the train text).
+#
+# Throughput settings (flash_attention / tpu_fsdp / batch / grad_checkpoint) are meant to be
+# set from a TPU_SWEEP run of tools/tpu_sweep.py, not guessed: the edu phase ran at ~66k tok/s,
+# ~6% of the v5e-8's bf16 peak, with only 2 sequences per chip.
+#
+# WSD schedule: flat LR after warmup, 1-sqrt cooldown over the last wsd_decay_steps. While
+# the run is still flat it extends by raising the pretrain_large_edu2 budget (the notebook
+# sets lr_decay_steps to it), with no re-warm and nothing wasted.
+model_type: transformer
+vocab_size: 16384
+d_model: 1024
+n_layers: 16
+n_heads: 16
+seq_len: 1024
+dropout: 0.0
+tie_embeddings: false
+
+dataset_type: text
+train_path: ""
+val_path: ""
+val_old_path: ""     # the notebook points it at val_old.bin (the base's val) when present
+tokenizer_path: ""
+instruction_data: ""
+
+batch_size: 64       # GLOBAL micro-batch: 8 per chip x 8 chips
+grad_accum_steps: 2  # 64 x 2 = eff batch 128 seqs = 131k tokens/step (2x the edu phase)
+tpu_cores: 0
+tpu_spmd: true
+tpu_fsdp: true
+flash_attention: true
+tpu_fuse_step: true
+num_workers: 4
+lr: 1.5e-4           # ~sqrt(2) x the edu phase's 1e-4 for the doubled batch; base peaked at 2.5e-4
+weight_decay: 0.01
+lr_schedule: wsd
+max_steps: 70000     # overwritten per session; the notebook caps at the pretrain_large_edu2 budget
+warmup_steps: 1000
+lr_decay_steps: 70000   # overwritten by the notebook with the budget
+wsd_decay_steps: 10000  # ~14% of the run; the cooldown is where most of WSD's gain lands
+grad_clip: 1.0
+grad_checkpoint: true
+compile: false
+seed: 43             # not the edu phase's 42: a different draw order over the shared text
+
+checkpoint_dir: checkpoints/transformer_tpu_large_edu2
+checkpoint_every: 1000  # ~2.8GB latest.pt per save + push
+checkpoint_keep_last: 0
+eval_every: 1000
+log_every: 50
+max_eval_batches: 32   # x 64 = 2048 non-overlapping windows (~2.1M tokens) spread over val.bin
+early_stop_patience: 0 # a flat-LR phase isn't expected to keep improving val every eval

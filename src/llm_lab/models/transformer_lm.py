@@ -19,6 +19,24 @@ def _grad_checkpoint(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
     return torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
 
 
+def _xla_flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
+    """Causal attention through torch_xla's Pallas flash kernel, (B, H, L, D) in and out.
+
+    On XLA, SDPA lowers to the math path and materializes every head's L x L scores; the
+    kernel tiles them in VMEM instead. Under SPMD the kernel needs the batch sharding spelled
+    out (it is a custom call the partitioner can't see into), so pass the global mesh's batch
+    axis. No attention dropout: the pretraining configs run dropout 0.
+    """
+    from torch_xla.experimental.custom_kernel import flash_attention
+    import torch_xla.runtime as xr
+    if xr.is_spmd():
+        import torch_xla.distributed.spmd as xs
+        mesh = xs.get_global_mesh()
+        return flash_attention(q, k, v, causal=True, sm_scale=scale,
+                               partition_spec=(mesh.axis_names[0], None, None, None), mesh=mesh)
+    return flash_attention(q, k, v, causal=True, sm_scale=scale)
+
+
 class TransformerLM(nn.Module):
     """Small causal transformer LM with RoPE."""
 
@@ -32,11 +50,12 @@ class TransformerLM(nn.Module):
         dropout: float = 0.0,
         use_grad_checkpoint: bool = False,
         tie_embeddings: bool = True,
+        flash_attention: bool = False,
     ):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.layers = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, seq_len, dropout)
+            TransformerBlock(d_model, n_heads, seq_len, dropout, flash_attention)
             for _ in range(n_layers)
         ])
         self.norm_f = RMSNorm(d_model)
@@ -59,10 +78,11 @@ class TransformerLM(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, seq_len: int, dropout: float):
+    def __init__(self, d_model: int, n_heads: int, seq_len: int, dropout: float,
+                 flash_attention: bool = False):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads, seq_len, dropout)
+        self.attn = CausalSelfAttention(d_model, n_heads, seq_len, dropout, flash_attention)
         self.norm2 = RMSNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
@@ -78,11 +98,13 @@ class TransformerBlock(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, seq_len: int, dropout: float):
+    def __init__(self, d_model: int, n_heads: int, seq_len: int, dropout: float,
+                 flash_attention: bool = False):
         super().__init__()
         assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        self.flash_attention = flash_attention
 
         self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
@@ -104,10 +126,13 @@ class CausalSelfAttention(nn.Module):
         q = self._apply_rope(q, L)
         k = self._apply_rope(k, L)
 
-        # scaled dot-product with causal mask
-        attn = F.scaled_dot_product_attention(
-            q, k, v, is_causal=True, dropout_p=self.attn_dropout.p if self.training else 0.0
-        )
+        if self.flash_attention and x.device.type == "xla":
+            attn = _xla_flash_attention(q, k, v, 1.0 / math.sqrt(self.head_dim))
+        else:
+            # scaled dot-product with causal mask
+            attn = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, dropout_p=self.attn_dropout.p if self.training else 0.0
+            )
         attn = attn.transpose(1, 2).reshape(B, L, -1)
         return self.out_proj(attn)
 

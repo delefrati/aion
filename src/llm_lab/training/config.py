@@ -32,6 +32,10 @@ class TrainConfig:
     warmup_steps: int = 200
     lr_decay_steps: int = 0  # cosine decay horizon; 0 = use max_steps. Set to the FULL
     #                          multi-session target so per-session max_steps doesn't zero the LR.
+    lr_schedule: str = "cosine"  # "cosine" | "wsd" (warmup-stable-decay: flat at lr until the
+    #                              last wsd_decay_steps before lr_decay_steps, then 1-sqrt to 0;
+    #                              while still flat, the run extends by raising lr_decay_steps)
+    wsd_decay_steps: int = 0  # wsd only: length of the final decay window
     grad_clip: float = 1.0
     grad_accum_steps: int = 1  # gradient accumulation (effective batch = batch_size * grad_accum_steps)
     grad_checkpoint: bool = False  # activation checkpointing (saves VRAM, allows larger batch)
@@ -49,6 +53,14 @@ class TrainConfig:
     #                         compile, batch sharded on a 'data' mesh axis) instead of one
     #                         xmp.spawn process per core. batch_size is then the GLOBAL
     #                         micro-batch and must divide by the chip count.
+    flash_attention: bool = False  # TPU only: Pallas flash-attention kernel instead of SDPA, which
+    #                                XLA lowers to the plain math path (full L x L scores per head)
+    tpu_fsdp: bool = False  # with tpu_spmd: shard params, grads and optimizer state over the chips
+    #                         (FSDPv2) instead of replicating ~3.8GB of them on every chip
+    tpu_fuse_step: bool = False  # TPU: skip the flush after the LAST micro-step so it compiles into
+    #                              one graph with the optimizer step (one fewer graph per step)
+    max_train_minutes: float = 0  # >0: stop at the first step past this many minutes of training,
+    #                               save, and return (single-process / SPMD only); 0 = off
     foreach_optim: bool = True  # foreach AdamW is faster but allocates temp buffers for ALL params at once (a large transient spike); set False on tight VRAM
     seed: int = 42
 
@@ -58,7 +70,8 @@ class TrainConfig:
     checkpoint_keep_last: int = 2  # numbered step_*.pt archives to keep; 0 = only latest.pt+best.pt (saves ~keep_last*ckpt_size of disk)
     eval_every: int = 250
     log_every: int = 50
-    max_eval_batches: int = 0  # 0 = all
+    max_eval_batches: int = 0  # 0 = all. Text val takes this many batches of non-overlapping
+    #                            windows spread evenly over the whole val file
 
     # early stopping (0 patience = disabled)
     early_stop_patience: int = 0  # stop after this many evals with no val_loss improvement
@@ -67,6 +80,7 @@ class TrainConfig:
     # data
     train_path: str = ""
     val_path: str = ""
+    val_old_path: str = ""  # optional second text val set (e.g. the previous phase's), logged as val_old_loss
     tokenizer_path: str = ""
 
     # instruction tuning

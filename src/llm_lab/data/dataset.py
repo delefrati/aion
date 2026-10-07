@@ -17,8 +17,11 @@ class TextDataset(Dataset):
     Subsequent loads use the cache directly (mmap for zero-copy reads).
     """
 
-    def __init__(self, path: Path, tokenizer: Tokenizer, seq_len: int = 256):
+    def __init__(self, path: Path, tokenizer: Tokenizer, seq_len: int = 256, stride: int = 1):
         self.seq_len = seq_len
+        # Token offset between consecutive windows. 1 suits random training draws; eval wants
+        # seq_len, so a batch is distinct text and not the same document shifted one token.
+        self.stride = max(1, stride)
         cache_path = path.with_suffix(".bin")
 
         # Use the token cache if it exists and is at least as new as the source text.
@@ -62,10 +65,12 @@ class TextDataset(Dataset):
             self.ids = np.memmap(cache_path, dtype=np.uint16, mode="r")
 
     def __len__(self) -> int:
-        return max(0, len(self.ids) - self.seq_len)
+        # A window needs seq_len + 1 tokens (inputs plus the shifted labels).
+        return max(0, (len(self.ids) - self.seq_len - 1) // self.stride + 1)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        chunk = torch.from_numpy(self.ids[idx : idx + self.seq_len + 1].astype(np.int64))
+        start = idx * self.stride
+        chunk = torch.from_numpy(self.ids[start : start + self.seq_len + 1].astype(np.int64))
         return {
             "input_ids": chunk[:-1],
             "labels": chunk[1:],
