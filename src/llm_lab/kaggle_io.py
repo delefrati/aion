@@ -10,6 +10,7 @@ disk never holds the archive and its contents at the same time.
 
 Notebooks import this after Cell 1 puts src/ on sys.path.
 """
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -19,8 +20,17 @@ from pathlib import Path
 _MISSING_MARKERS = ("403", "404", "not found", "doesn't exist", "does not exist")
 
 
+# Inside a notebook the CLI authenticates with the notebook-scoped token named by
+# $KAGGLE_API_V1_TOKEN before it reads KAGGLE_USERNAME/KAGGLE_KEY. That token 401s on
+# pushes and can't see the private Datasets: kaggle-pretrain-tpu v358732932 (2026-10-16)
+# got "missing" for both existing checkpoint Datasets. Dropping it makes the CLI use the
+# account key, which every notebook puts in the environment in Cell 1.
+_NOTEBOOK_TOKENS = ("KAGGLE_API_V1_TOKEN", "KAGGLE_API_TOKEN")
+
+
 def _kaggle(*args):
-    res = subprocess.run(["kaggle", *args], capture_output=True, text=True)
+    env = {k: v for k, v in os.environ.items() if k not in _NOTEBOOK_TOKENS}
+    res = subprocess.run(["kaggle", *args], capture_output=True, text=True, env=env)
     return res.returncode, ((res.stdout or "") + (res.stderr or "")).strip()
 
 
@@ -58,6 +68,8 @@ def download_dataset(slug, dest, required=("latest.pt",), attempts=6, wait=20, o
         if files is not None:
             break
         if any(m in out.lower() for m in _MISSING_MARKERS):
+            # A 403 is also what a credential without access gets, so show what was said.
+            print(f"{slug}: treating as missing. The listing answered:\n{out[-400:]}")
             return None
         print(f"Listing {slug} failed (attempt {attempt}/{attempts}); retrying in {wait}s...\n{out[-400:]}")
         time.sleep(wait)
