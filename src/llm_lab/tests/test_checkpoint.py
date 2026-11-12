@@ -12,6 +12,7 @@ import torch
 
 from llm_lab.training import checkpoint, trainer
 from llm_lab.training.model_factory import build_model
+from llm_lab.tests.helpers import legacy_checkpoint as _legacy_checkpoint
 
 SRC = Path(__file__).resolve().parents[2]
 
@@ -69,21 +70,6 @@ def test_untied_weights_build_an_untied_model(tiny_cfg, tmp_path):
     assert loaded.lm_head.weight is not loaded.embedding.weight
     assert torch.equal(loaded.lm_head.weight, model.lm_head.weight)
     assert torch.equal(loaded.embedding.weight, model.embedding.weight)
-
-
-def _legacy_checkpoint(cfg, path: Path, step: int) -> dict:
-    """An old-style latest.pt, as the trainer wrote it before AION-8."""
-    torch.manual_seed(1)
-    model = build_model(cfg)
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
-    model(torch.zeros(1, 4, dtype=torch.long)).sum().backward()
-    opt.step()
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 1.0)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"step": step, "model": {"_orig_mod." + k: v for k, v in model.state_dict().items()},
-                "optimizer": opt.state_dict(), "scheduler": sched.state_dict(),
-                "metrics_log": [{"step": step, "train_loss": 3.0}]}, path)
-    return checkpoint.strip_prefixes(model.state_dict())
 
 
 def test_old_pt_still_loads_with_a_config(tiny_cfg, tmp_path):

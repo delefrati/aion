@@ -77,10 +77,8 @@ def _run(name: str, overrides: dict, base: dict, seed: Path, work: Path, steps: 
             hbm.append(float(m.group(1)))
     rc = proc.wait()
     row = {"name": name, "overrides": overrides, "rc": rc, "wall_s": round(time.time() - t0)}
-    try:
-        log = json.loads((d / "metrics.json").read_text())
-    except Exception:
-        log = []
+    from llm_lab.training import metrics
+    log = metrics.read(d / metrics.FILE)
     toks = [e["tok_s"] for e in log if "tok_s" in e][1:]  # the first window includes the compile
     vals = [e["val_loss"] for e in log if "val_loss" in e]
     losses = [e["train_loss"] for e in log if "train_loss" in e]

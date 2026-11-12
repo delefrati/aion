@@ -8,6 +8,8 @@ A checkpoint called `name` in a directory `d` is three files:
                          data id and parent run: enough to rebuild the model with no YAML
     d/name.optim.pt      optimizer + scheduler state; absent for a weights-only checkpoint
 
+A run's metrics aren't part of any checkpoint: they go to metrics.jsonl (training/metrics.py).
+
 Checkpoints written before this format are one pickle, `d/name.pt`, holding "model",
 "step", "optimizer", "scheduler" and "metrics_log". Every reader here still accepts them;
 they carry no config, so building a model from one needs a TrainConfig from the caller.
@@ -155,12 +157,13 @@ def read_weights(ref: Ref) -> dict[str, torch.Tensor]:
 
 
 def read_training(ref: Ref) -> dict:
-    """{"optimizer", "scheduler", "metrics_log"}: each None/[] when the checkpoint has none."""
+    """{"optimizer", "scheduler"}, each None when the checkpoint has none. An old .pt also
+    gives "metrics_log", the history it carried inside it."""
     if ref.legacy:
         ckpt = _legacy(ref)
         return {"optimizer": ckpt.get("optimizer"), "scheduler": ckpt.get("scheduler"),
                 "metrics_log": ckpt.get("metrics_log", [])}
-    out = {"optimizer": None, "scheduler": None, "metrics_log": []}
+    out = {"optimizer": None, "scheduler": None}
     if ref.optim.is_file():
         out.update(torch.load(ref.optim, map_location="cpu", weights_only=False))
     return out

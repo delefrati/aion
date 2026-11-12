@@ -38,7 +38,7 @@ from tqdm import tqdm
 from llm_lab.data.dataset import TextDataset
 from llm_lab.data.instruction import InstructionDataset, MultiTurnDataset, collate_instruction
 from llm_lab.tokenizer.bpe import load_tokenizer
-from llm_lab.training import checkpoint
+from llm_lab.training import checkpoint, metrics
 from llm_lab.training.checkpoint import strip_prefixes as _strip_prefixes
 from llm_lab.training.config import TrainConfig
 from llm_lab.training.model_factory import build_model  # noqa: F401
@@ -412,12 +412,12 @@ def _make_scheduler(cfg: TrainConfig, optimizer):
 
 
 def _resume_if_available(cfg: TrainConfig, model, optimizer, scheduler, ckpt_dir: Path,
-                         device: torch.device, is_master: bool) -> tuple[int, list[dict], dict]:
+                         device: torch.device, is_master: bool) -> tuple[int, dict, list[dict]]:
     """Resume from the latest checkpoint if there is one (new format, else an old latest.pt).
-    Returns (start_step, metrics_log, its state)."""
+    Returns (start_step, its state, the metrics an old .pt carried inside it)."""
     ref = checkpoint.find(ckpt_dir)
     if ref is None:
-        return 0, [], {}
+        return 0, {}, []
 
     # Load on CPU: storages saved from an XLA device are tagged "xla:0" and can't be
     # restored directly onto an XLA device. load_state_dict then copies onto `device`.
@@ -447,15 +447,7 @@ def _resume_if_available(cfg: TrainConfig, model, optimizer, scheduler, ckpt_dir
     if training["scheduler"] is not None and not reset_opt:
         scheduler.load_state_dict(training["scheduler"])
     step = state["step"]
-    # Drop history from beyond the resumed step. A checkpoint rolled back to an earlier step
-    # keeps the whole metrics_log, so the log can describe steps these weights never reached.
-    # Everything downstream that asks "how far along are we?" by taking max(step) over
-    # metrics.json then reads a counter stuck in the future — including the notebooks'
-    # auto-push watcher, which goes silent for the rest of the run because the counter never
-    # advances past what it already banked.
-    _full_log = training["metrics_log"] or []
-    metrics_log = [e for e in _full_log if e.get("step", 0) <= step]
-    _dropped = len(_full_log) - len(metrics_log)
+    legacy_log = training.get("metrics_log") or []
     fresh = training["optimizer"] is None or reset_opt
     # Free the checkpoint from host RAM before the first step (the CPU copy is no longer
     # needed once weights + optimizer state are on the device).
@@ -466,10 +458,34 @@ def _resume_if_available(cfg: TrainConfig, model, optimizer, scheduler, ckpt_dir
         torch.cuda.empty_cache()
     if is_master:
         tqdm.write(f"Resumed from step {step} ({ref.weights.name})"
-                   + (" (fresh optimizer — clean fine-tune start)" if fresh else "")
-                   + (f"; dropped {_dropped} metrics entries from beyond step {step}"
-                      if _dropped else ""))
-    return step, metrics_log, state
+                   + (" (fresh optimizer — clean fine-tune start)" if fresh else ""))
+    return step, state, legacy_log
+
+
+def _load_history(ckpt_dir: Path, start_step: int, legacy_log: list[dict], is_master: bool) -> list[dict]:
+    """The run's metrics up to start_step, and (master) metrics.jsonl ready to append to.
+
+    Only history up to the resumed step counts: a rollback, or a session that logged past
+    its last banked checkpoint, leaves later entries these weights never reached. The file
+    keeps them (it is append-only); the resume line written here tells readers to drop them.
+    Every rank computes the same history, before the master writes anything.
+    """
+    path = ckpt_dir / metrics.FILE
+    old_json = ckpt_dir / "metrics.json"  # where the trainer kept history before metrics.jsonl
+    if path.exists():
+        history = metrics.read(path)
+        imported = []
+    else:
+        # An old checkpoint carried its history inside it, and in metrics.json beside it.
+        imported = legacy_log or (json.loads(old_json.read_text()) if old_json.is_file() else [])
+        history = imported
+    history = [e for e in history if e.get("step", 0) <= start_step]
+    if is_master:
+        if imported:
+            metrics.append(path, [e for e in imported if e.get("step", 0) <= start_step])
+        metrics.mark_resume(path, start_step)
+        old_json.unlink(missing_ok=True)
+    return history
 
 
 def _run_info(cfg: TrainConfig, ckpt_dir: Path, resumed: dict, start_step: int,
@@ -603,9 +619,16 @@ def train(cfg: TrainConfig) -> dict:
     best_val_loss = float("inf")
     best_step = 0
     evals_since_improve = 0  # for early stopping
-    start_step, metrics_log, resumed_state = _resume_if_available(
+    start_step, resumed_state, legacy_log = _resume_if_available(
         cfg, model, optimizer, scheduler, ckpt_dir, device, is_master
     )
+    metrics_log = _load_history(ckpt_dir, start_step, legacy_log, is_master)
+    metrics_path = ckpt_dir / metrics.FILE
+
+    def _record(entry: dict) -> None:
+        metrics_log.append(entry)
+        if is_master:
+            metrics.append(metrics_path, [entry])
     if is_master and cfg.tokenizer_path and not (ckpt_dir / "tokenizer.json").exists():
         shutil.copy2(cfg.tokenizer_path, ckpt_dir / "tokenizer.json")  # a checkpoint dir stands alone
 
@@ -767,7 +790,7 @@ def train(cfg: TrainConfig) -> dict:
                     "elapsed_s": round(elapsed, 1),
                     "tok_s": round(tok_s),
                 }
-                metrics_log.append(entry)
+                _record(entry)
                 tqdm.write(
                     f"step {entry['step']:>5d} | loss {entry['train_loss']:.4f} | "
                     f"lr {entry['lr']:.2e} | {elapsed:.0f}s | {tok_s / 1e3:.1f}k tok/s"
@@ -789,7 +812,7 @@ def train(cfg: TrainConfig) -> dict:
                         val_old = _reduce_mean(val_old, is_tpu, device)
                     entry["val_old_loss"] = val_old
                     note = f" | val_old_loss {val_old:.4f}"
-                metrics_log.append(entry)
+                _record(entry)
                 if is_master:
                     tqdm.write(f"step {step + 1:>5d} | val_loss {val_loss:.4f}{note}")
                 min_delta = getattr(cfg, "early_stop_min_delta", 0.0)
@@ -803,7 +826,7 @@ def train(cfg: TrainConfig) -> dict:
                     best_step = step + 1
                     if is_tpu or is_master:
                         _save_checkpoint(
-                            run_info, model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir,
+                            run_info, model, optimizer, scheduler, step + 1, ckpt_dir,
                             is_tpu=is_tpu, best=True, best_val_loss=best_val_loss,
                             is_master=is_master,
                         )
@@ -825,9 +848,7 @@ def train(cfg: TrainConfig) -> dict:
                             f"{evals_since_improve} evals (best {best_val_loss:.4f} @ step {best_step})."
                         )
                     if is_tpu or is_master:
-                        _save_checkpoint(run_info, model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu, is_master=is_master)
-                    if is_master:
-                        (ckpt_dir / "metrics.json").write_text(json.dumps(metrics_log, indent=2))
+                        _save_checkpoint(run_info, model, optimizer, scheduler, step + 1, ckpt_dir, is_tpu=is_tpu, is_master=is_master)
                     return {
                         "early_stopped_at_step": step + 1,
                         "best_val_loss": best_val_loss,
@@ -838,7 +859,7 @@ def train(cfg: TrainConfig) -> dict:
             # checkpoint
             if (step + 1) % cfg.checkpoint_every == 0 and (is_tpu or is_master):
                 _save_checkpoint(
-                    run_info, model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu, is_master=is_master,
+                    run_info, model, optimizer, scheduler, step + 1, ckpt_dir, is_tpu=is_tpu, is_master=is_master,
                     keep_last=getattr(cfg, "checkpoint_keep_last", 2),
                 )
 
@@ -847,7 +868,7 @@ def train(cfg: TrainConfig) -> dict:
                 _save_requested = False
                 tqdm.write(f"SIGUSR1 received — saving checkpoint at step {step + 1}")
                 _save_checkpoint(
-                    run_info, model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu,
+                    run_info, model, optimizer, scheduler, step + 1, ckpt_dir, is_tpu=is_tpu,
                     is_master=is_master,
                 )
 
@@ -863,9 +884,7 @@ def train(cfg: TrainConfig) -> dict:
             if world_size > 1:
                 raise
             tqdm.write(f"\nInterrupted at step {step + 1} — saving checkpoint before exit...")
-            _save_checkpoint(run_info, model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu, is_master=is_master)
-            metrics_path = ckpt_dir / "metrics.json"
-            metrics_path.write_text(json.dumps(metrics_log, indent=2))
+            _save_checkpoint(run_info, model, optimizer, scheduler, step + 1, ckpt_dir, is_tpu=is_tpu, is_master=is_master)
             return {"interrupted_at_step": step + 1, "param_count": param_count}
 
     # final checkpoint + eval
@@ -873,13 +892,8 @@ def train(cfg: TrainConfig) -> dict:
     if world_size > 1:
         val_loss = _reduce_mean(val_loss, is_tpu, device)
     if is_tpu or is_master:
-        _save_checkpoint(run_info, model, optimizer, scheduler, end_step, metrics_log, ckpt_dir, is_tpu=is_tpu, is_master=is_master,
+        _save_checkpoint(run_info, model, optimizer, scheduler, end_step, ckpt_dir, is_tpu=is_tpu, is_master=is_master,
                          keep_last=getattr(cfg, "checkpoint_keep_last", 2))
-
-    # save metrics
-    if is_master:
-        metrics_path = ckpt_dir / "metrics.json"
-        metrics_path.write_text(json.dumps(metrics_log, indent=2))
 
     return {
         "final_val_loss": val_loss,
@@ -1071,7 +1085,7 @@ def seed_checkpoint(src, dst_dir, name: str = "latest", parent: dict | None = No
 
 
 def _save_checkpoint(
-    run_info: dict, model, optimizer, scheduler, step: int, metrics_log: list, ckpt_dir: Path,
+    run_info: dict, model, optimizer, scheduler, step: int, ckpt_dir: Path,
     keep_last: int = 2, is_tpu: bool = False, best: bool = False, best_val_loss: float | None = None,
     is_master: bool = True,
 ) -> None:
@@ -1093,7 +1107,6 @@ def _save_checkpoint(
         training = {
             "optimizer": _cpu(optimizer.state_dict(), is_tpu) if is_tpu else optimizer.state_dict(),
             "scheduler": scheduler.state_dict() if scheduler else None,
-            "metrics_log": metrics_log,
         }
     state = {
         "step": step,
@@ -1108,10 +1121,8 @@ def _save_checkpoint(
         state["best_val_loss"] = best_val_loss
 
     # Use the caller's is_master, which comes from xr.global_ordinal() like every other rank
-    # check in this file. This used to call xm.is_master_ordinal(), a DIFFERENT api that
-    # defaults to the *local* ordinal -- when the two disagreed, latest.pt still updated but
-    # metrics.json did not, so the notebooks' auto-push watcher polled a step counter frozen
-    # at the resume point and never banked anything.
+    # check in this file. (xm.is_master_ordinal() is a DIFFERENT api that defaults to the
+    # *local* ordinal; when the two disagreed, half of a save's files were never written.)
     if is_master:
         name = "best" if best else "latest"
         ref = checkpoint.write(ckpt_dir, name, weights, alias_map, state, training)
@@ -1122,7 +1133,6 @@ def _save_checkpoint(
             if keep_last > 0:
                 for src in (ref.weights, ref.state, ref.optim):
                     shutil.copyfile(src, ckpt_dir / src.name.replace("latest", f"step_{step}", 1))
-            (ckpt_dir / "metrics.json").write_text(json.dumps(metrics_log))
             tqdm.write(f"Checkpoint saved: {ref.weights} (step {step})")
             # Keep only the last N numbered archives, old .pt ones included. With keep_last=0
             # nothing numbered is written, so this just sweeps archives of earlier sessions.
