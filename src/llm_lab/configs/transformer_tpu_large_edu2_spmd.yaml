@@ -2,9 +2,8 @@
 # (step 0, fresh optimizer), trained on the ~10B-token pretrain_edu x5 cache
 # (aion-pretrain-edu-xl-tokenized; same mix and val.bin as the edu phase, 5x the train text).
 #
-# Throughput settings (flash_attention / tpu_fsdp / batch / grad_checkpoint) are meant to be
-# set from a TPU_SWEEP run of tools/tpu_sweep.py, not guessed: the edu phase ran at ~66k tok/s,
-# ~6% of the v5e-8's bf16 peak, with only 2 sequences per chip.
+# Throughput settings are the 2026-10-18 TPU sweep's winner: FSDPv2, 8 sequences per chip, the
+# fused step, no flash attention: 205k tok/s vs the edu phase's ~66k (2 per chip, no FSDP).
 #
 # WSD schedule: flat LR after warmup, 1-sqrt cooldown over the last wsd_decay_steps. While
 # the run is still flat it extends by raising the pretrain_large_edu2 budget (the notebook
@@ -30,7 +29,7 @@ grad_accum_steps: 2  # 64 x 2 = eff batch 128 seqs = 131k tokens/step (2x the ed
 tpu_cores: 0
 tpu_spmd: true
 tpu_fsdp: true
-flash_attention: true
+flash_attention: false  # every flash variant failed in the 2026-10-18 sweep: Kaggle's libtpu is too old for Pallas
 tpu_fuse_step: true
 num_workers: 4
 lr: 1.5e-4           # ~sqrt(2) x the edu phase's 1e-4 for the doubled batch; base peaked at 2.5e-4
