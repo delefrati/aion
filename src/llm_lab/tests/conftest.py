@@ -37,25 +37,24 @@ def corpus(tmp_path_factory) -> dict[str, Path]:
 def tiny_cfg(corpus, tmp_path):
     """A ~20k-parameter transformer that trains a step in a few milliseconds."""
     from llm_lab.training.config import TrainConfig
-    return TrainConfig(
+    return TrainConfig.from_dict(dict(
         model_type="transformer", vocab_size=128, d_model=32, n_layers=2, n_heads=2, seq_len=16,
         batch_size=4, lr=1e-3, warmup_steps=2, max_steps=6, checkpoint_every=3, eval_every=3,
         log_every=1, max_eval_batches=2, num_workers=0, use_8bit_optim=False,
         checkpoint_keep_last=1, seed=0,
         train_path=str(corpus["train"]), val_path=str(corpus["val"]),
         tokenizer_path=str(corpus["tokenizer"]), checkpoint_dir=str(tmp_path / "ckpt"),
-    )
+    ))
 
 
 @pytest.fixture
 def chat_cfg(tiny_cfg, tmp_path):
     """The tiny model finetuning on a tiny chat set: a run that keeps a best checkpoint."""
     import json
-    from dataclasses import replace
     chat = tmp_path / "chat.json"
     chat.write_text(json.dumps([{"messages": [{"role": "user", "content": "the cat"},
                                               {"role": "assistant", "content": "sat on the mat"}]}] * 40))
-    return replace(tiny_cfg, dataset_type="chat", instruction_data=str(chat), train_path="", val_path="")
+    return tiny_cfg.replace(dataset_type="chat", instruction_data=str(chat), train_path="", val_path="")
 
 
 class FakeKaggle:

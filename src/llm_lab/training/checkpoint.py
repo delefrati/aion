@@ -352,9 +352,9 @@ def config_from_state(state: dict, cfg=None):
         if not state.get("config"):
             raise ValueError("This is an old .pt checkpoint, which doesn't record its config: "
                              "pass the training YAML (--config).")
-        cfg = TrainConfig.from_dict(state["config"])
-        if "tied" in state and cfg.model_type == "transformer":
-            cfg.tie_embeddings = bool(state["tied"])
+        cfg = TrainConfig.from_dict(state["config"], strict=False)  # saved by some version
+        if "tied" in state and cfg.model.model_type == "transformer":
+            cfg.model.tie_embeddings = bool(state["tied"])
     return cfg
 
 

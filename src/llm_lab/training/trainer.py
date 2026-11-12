@@ -25,7 +25,7 @@ except ImportError:
 # Global flag for on-demand checkpoint save (set via SIGUSR1)
 _save_requested = False
 
-# SPMD device mesh when one process drives every TPU chip (cfg.tpu_spmd); None otherwise.
+# SPMD device mesh when one process drives every TPU chip (cfg.device.tpu_spmd); None otherwise.
 _spmd_mesh = None
 
 
@@ -226,7 +226,7 @@ def _val_loader(val_ds, batch_size, num_workers, distributed, world_size, ordina
 def _make_old_val_loader(val_old_path, tokenizer, seq_len, batch_size, max_eval_batches: int,
                          num_workers: int = 2, world_size: int = 1, ordinal: int = 0,
                          is_tpu: bool = False, device=None):
-    """Loader for the optional second text val set (cfg.val_old_path), scored like val."""
+    """Loader for the optional second text val set (cfg.data.val_old_path), scored like val."""
     ds = _text_val_dataset(val_old_path, tokenizer, seq_len, max_eval_batches * batch_size * world_size)
     return _val_loader(ds, batch_size, num_workers, world_size > 1, world_size, ordinal, True,
                        num_workers > 0 and not is_tpu, None, is_tpu, device)
@@ -336,18 +336,18 @@ def _hbm_note(device, is_tpu: bool) -> str:
 def _build_optimizer(cfg: TrainConfig, model, device: torch.device, is_master: bool):
     """8-bit AdamW when bitsandbytes is available (saves ~280MB), else foreach/standard AdamW."""
     try:
-        if not getattr(cfg, "use_8bit_optim", True):
+        if not cfg.device.use_8bit_optim:
             raise ImportError("8-bit optimizer disabled via config")
         import bitsandbytes as bnb
         optimizer = bnb.optim.AdamW8bit(
-            model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
+            model.parameters(), lr=cfg.schedule.lr, weight_decay=cfg.schedule.weight_decay,
         )
         if is_master:
             tqdm.write(".8-bit AdamW enabled (saves ~280MB)")
     except ImportError:
-        use_foreach = device.type == "cuda" and getattr(cfg, "foreach_optim", True)
+        use_foreach = device.type == "cuda" and cfg.device.foreach_optim
         optimizer = torch.optim.AdamW(
-            model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
+            model.parameters(), lr=cfg.schedule.lr, weight_decay=cfg.schedule.weight_decay,
             foreach=use_foreach,
         )
         if is_master:
@@ -365,25 +365,25 @@ def _make_scheduler(cfg: TrainConfig, optimizer):
     every session (LambdaLR doesn't save it), so a WSD run still in its flat part extends
     just by raising lr_decay_steps.
     """
-    lr_decay_steps = getattr(cfg, "lr_decay_steps", 0) or cfg.max_steps
-    schedule = getattr(cfg, "lr_schedule", "cosine")
+    lr_decay_steps = cfg.schedule.lr_decay_steps or cfg.schedule.max_steps
+    schedule = cfg.schedule.lr_schedule
     if schedule not in ("cosine", "wsd"):
         raise ValueError(f"lr_schedule must be 'cosine' or 'wsd', got {schedule!r}")
-    decay_len = getattr(cfg, "wsd_decay_steps", 0)
-    if schedule == "wsd" and not 0 < decay_len <= lr_decay_steps - cfg.warmup_steps:
+    decay_len = cfg.schedule.wsd_decay_steps
+    if schedule == "wsd" and not 0 < decay_len <= lr_decay_steps - cfg.schedule.warmup_steps:
         raise ValueError(f"wsd needs 0 < wsd_decay_steps ({decay_len}) <= lr_decay_steps - "
-                         f"warmup_steps ({lr_decay_steps - cfg.warmup_steps}).")
+                         f"warmup_steps ({lr_decay_steps - cfg.schedule.warmup_steps}).")
     decay_start = lr_decay_steps - decay_len
 
     def lr_lambda(step: int) -> float:
-        if step < cfg.warmup_steps:
-            return step / max(1, cfg.warmup_steps)
+        if step < cfg.schedule.warmup_steps:
+            return step / max(1, cfg.schedule.warmup_steps)
         if schedule == "wsd":
             if step < decay_start:
                 return 1.0
             # 1-sqrt cooldown (Hägele et al. 2024): matches cosine at equal compute.
             return max(0.0, 1.0 - math.sqrt(min(1.0, (step - decay_start) / decay_len)))
-        progress = (step - cfg.warmup_steps) / max(1, lr_decay_steps - cfg.warmup_steps)
+        progress = (step - cfg.schedule.warmup_steps) / max(1, lr_decay_steps - cfg.schedule.warmup_steps)
         progress = min(1.0, max(0.0, progress))
         return 0.5 * (1 + math.cos(math.pi * progress))
 
@@ -409,7 +409,7 @@ def _resume_if_available(cfg: TrainConfig, model, optimizer, scheduler, ckpt_dir
         tqdm.write(f"WARNING: checkpoint/model key mismatch — missing={list(incompat.missing_keys)[:4]} "
                    f"unexpected={list(incompat.unexpected_keys)[:4]} (architecture may differ from checkpoint)")
     training = checkpoint.read_training(ref)
-    reset_opt = getattr(cfg, "reset_optimizer", False)
+    reset_opt = cfg.schedule.reset_optimizer
     if training["optimizer"] is not None and not reset_opt:
         try:
             optimizer.load_state_dict(training["optimizer"])
@@ -476,7 +476,7 @@ def _run_info(cfg: TrainConfig, ckpt_dir: Path, resumed: dict, start_step: int,
     """What every checkpoint of this session records in its state.json besides the step."""
     from dataclasses import asdict
     files = {}
-    for p in (cfg.train_path, cfg.val_path, getattr(cfg, "instruction_data", "")):
+    for p in (cfg.data.train_path, cfg.data.val_path, cfg.data.instruction_data):
         if p:
             # Text runs read the token cache (.bin); the .txt may never have been downloaded.
             f = Path(p).with_suffix(".bin") if Path(p).suffix == ".txt" else Path(p)
@@ -488,8 +488,8 @@ def _run_info(cfg: TrainConfig, ckpt_dir: Path, resumed: dict, start_step: int,
     tokens = resumed.get("tokens_seen")
     return {
         "config": asdict(cfg),
-        "tokenizer_sha256": checkpoint.file_sha256(cfg.tokenizer_path) if cfg.tokenizer_path else None,
-        "data": {"id": getattr(cfg, "data_id", "") or None, "files": files},
+        "tokenizer_sha256": checkpoint.file_sha256(cfg.data.tokenizer_path) if cfg.data.tokenizer_path else None,
+        "data": {"id": cfg.data.data_id or None, "files": files},
         "parent": parent,
         "start_step": start_step,
         "start_tokens": tokens if tokens is not None else start_step * tokens_per_step,
@@ -509,14 +509,14 @@ def train(cfg: TrainConfig) -> dict:
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGUSR1, _handle_save_signal)
 
-    torch.manual_seed(cfg.seed)
+    torch.manual_seed(cfg.schedule.seed)
     device = _get_device()
     is_tpu = HAS_XLA and device.type == "xla"
     if device.type == "cuda":
         torch.cuda.set_device(device)
 
     _spmd_mesh = None
-    use_fsdp = bool(getattr(cfg, "tpu_fsdp", False))
+    use_fsdp = bool(cfg.device.tpu_fsdp)
     if is_tpu:
         import torch_xla.runtime as xr
         if use_fsdp and not xr.is_spmd():
@@ -524,11 +524,11 @@ def train(cfg: TrainConfig) -> dict:
         if xr.is_spmd():
             _spmd_mesh = _init_spmd_mesh(fsdp=use_fsdp)
             n_chips = _spmd_mesh.size()
-            if cfg.batch_size % n_chips:
-                raise ValueError(f"tpu_spmd: batch_size {cfg.batch_size} is the global micro-batch "
+            if cfg.schedule.batch_size % n_chips:
+                raise ValueError(f"tpu_spmd: batch_size {cfg.schedule.batch_size} is the global micro-batch "
                                  f"and must divide by the {n_chips} chips.")
-            print(f"SPMD: 1 process over {n_chips} chips, batch {cfg.batch_size} "
-                  f"({cfg.batch_size // n_chips}/chip) sharded on the '{_spmd_mesh.axis_names[0]}' axis.")
+            print(f"SPMD: 1 process over {n_chips} chips, batch {cfg.schedule.batch_size} "
+                  f"({cfg.schedule.batch_size // n_chips}/chip) sharded on the '{_spmd_mesh.axis_names[0]}' axis.")
     elif use_fsdp:
         raise ValueError("tpu_fsdp is TPU-only.")
 
@@ -542,30 +542,30 @@ def train(cfg: TrainConfig) -> dict:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    tokenizer = load_tokenizer(Path(cfg.tokenizer_path))
+    tokenizer = load_tokenizer(Path(cfg.data.tokenizer_path))
 
     # Sequence length curriculum
-    curriculum = _parse_curriculum(cfg.seq_curriculum)
+    curriculum = _parse_curriculum(cfg.schedule.seq_curriculum)
     if curriculum:
         initial_seq_len = curriculum[0][0]
         if is_master:
             print(f"Curriculum: {' → '.join(f'{s}@{t}' for s, t in curriculum)}")
     else:
-        initial_seq_len = cfg.seq_len
+        initial_seq_len = cfg.model.seq_len
 
-    train_path = Path(cfg.train_path) if cfg.train_path else None
-    val_path = Path(cfg.val_path) if cfg.val_path else None
-    dataset_type = getattr(cfg, "dataset_type", "text")
-    instruction_data = getattr(cfg, "instruction_data", "")
+    train_path = Path(cfg.data.train_path) if cfg.data.train_path else None
+    val_path = Path(cfg.data.val_path) if cfg.data.val_path else None
+    dataset_type = cfg.data.dataset_type
+    instruction_data = cfg.data.instruction_data
     current_seq_len = initial_seq_len  # the loaders are built once the resume step is known
-    val_old_path = getattr(cfg, "val_old_path", "")
+    val_old_path = cfg.data.val_old_path
     if val_old_path and dataset_type != "text":
         raise ValueError("val_old_path is for text runs only.")
     val_old_loader = None
     if val_old_path:
         val_old_loader = _make_old_val_loader(
-            Path(val_old_path), tokenizer, cfg.seq_len, cfg.batch_size, cfg.max_eval_batches,
-            getattr(cfg, "num_workers", 2), world_size=world_size, ordinal=ordinal,
+            Path(val_old_path), tokenizer, cfg.model.seq_len, cfg.schedule.batch_size, cfg.schedule.max_eval_batches,
+            cfg.device.num_workers, world_size=world_size, ordinal=ordinal,
             is_tpu=is_tpu, device=device,
         )
 
@@ -578,10 +578,10 @@ def train(cfg: TrainConfig) -> dict:
         from torch.nn.parallel import DistributedDataParallel as DDP
         model = DDP(model, device_ids=[device.index])
         if is_master:
-            tqdm.write(f".Model: {cfg.model_type}, params: {param_count:,}, device: {device} x{world_size} (DDP/NCCL)")
+            tqdm.write(f".Model: {cfg.model.model_type}, params: {param_count:,}, device: {device} x{world_size} (DDP/NCCL)")
     elif is_master:
         topo = f" x{world_size} (xla-multiprocessing)" if world_size > 1 else ""
-        tqdm.write(f".Model: {cfg.model_type}, params: {param_count:,}, device: {device}{topo}")
+        tqdm.write(f".Model: {cfg.model.model_type}, params: {param_count:,}, device: {device}{topo}")
 
     # 8-bit AdamW saves ~280MB optimizer memory; fall back to foreach if unavailable
     optimizer = _build_optimizer(cfg, model, device, is_master)
@@ -589,7 +589,7 @@ def train(cfg: TrainConfig) -> dict:
     scheduler = _make_scheduler(cfg, optimizer)
 
     # resume from checkpoint
-    ckpt_dir = Path(cfg.checkpoint_dir)
+    ckpt_dir = Path(cfg.data.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_val_loss = float("inf")
     best_step = 0
@@ -600,7 +600,7 @@ def train(cfg: TrainConfig) -> dict:
     if is_master:
         # A rollback leaves later checkpoints (and maybe a BEST among them) from a branch
         # these weights never reached; a killed save leaves temp files. Clear both first.
-        checkpoint.prune(ckpt_dir, getattr(cfg, "checkpoint_keep_last", 2))
+        checkpoint.prune(ckpt_dir, cfg.schedule.checkpoint_keep_last)
     metrics_log = _load_history(ckpt_dir, start_step, legacy_log, is_master)
     metrics_path = ckpt_dir / metrics.FILE
 
@@ -608,13 +608,13 @@ def train(cfg: TrainConfig) -> dict:
         metrics_log.append(entry)
         if is_master:
             metrics.append(metrics_path, [entry])
-    if is_master and cfg.tokenizer_path and not (ckpt_dir / "tokenizer.json").exists():
-        shutil.copy2(cfg.tokenizer_path, ckpt_dir / "tokenizer.json")  # a checkpoint dir stands alone
+    if is_master and cfg.data.tokenizer_path and not (ckpt_dir / "tokenizer.json").exists():
+        shutil.copy2(cfg.data.tokenizer_path, ckpt_dir / "tokenizer.json")  # a checkpoint dir stands alone
 
     if use_fsdp:
         model = _fsdp_wrap(model, optimizer, is_master)
 
-    if getattr(cfg, "compile", False):
+    if cfg.device.compile:
         model = torch.compile(model)
         if is_master:
             tqdm.write("torch.compile enabled (first step will be slow — JIT compiling kernels)")
@@ -629,7 +629,7 @@ def train(cfg: TrainConfig) -> dict:
     # keep just their latest checkpoints and are judged by the benchmark at the phase's end
     # (llm_lab.session); best and early stopping are for finetuning.
     single_pass = dataset_type == "text"
-    if single_pass and getattr(cfg, "early_stop_patience", 0) > 0:
+    if single_pass and cfg.schedule.early_stop_patience > 0:
         raise ValueError("early_stop_patience is for finetuning; pretraining (dataset_type "
                          "'text') runs its whole budget. Remove it from the config.")
 
@@ -650,22 +650,22 @@ def train(cfg: TrainConfig) -> dict:
     # ...but that per-session reset also means patience must fit inside one session, or
     # the counter never reaches it and early stopping is silently dead. The first eval
     # always resets the counter (inf), so a session affords evals-1 increments.
-    _patience = getattr(cfg, "early_stop_patience", 0)
+    _patience = cfg.schedule.early_stop_patience
     if _patience > 0 and is_master:
-        _evals_this_session = (cfg.max_steps - start_step) // max(cfg.eval_every, 1)
+        _evals_this_session = (cfg.schedule.max_steps - start_step) // max(cfg.schedule.eval_every, 1)
         if _patience > _evals_this_session - 1:
             tqdm.write(
                 f"Note: early_stop_patience={_patience} exceeds this session's "
-                f"{_evals_this_session} evals ({cfg.max_steps - start_step} steps / "
-                f"eval_every {cfg.eval_every}) — early stopping cannot trigger. "
+                f"{_evals_this_session} evals ({cfg.schedule.max_steps - start_step} steps / "
+                f"eval_every {cfg.schedule.eval_every}) — early stopping cannot trigger. "
                 f"Lower it to <= {max(_evals_this_session - 1, 1)} to arm it."
             )
 
-    if start_step >= cfg.max_steps:
+    if start_step >= cfg.schedule.max_steps:
         # Nothing to train. Saving here would re-label the restored weights with the lower
         # max_steps and discard recorded progress.
         if is_master:
-            tqdm.write(f"Already at step {start_step} (max_steps {cfg.max_steps}): nothing to train.")
+            tqdm.write(f"Already at step {start_step} (max_steps {cfg.schedule.max_steps}): nothing to train.")
         return {"steps": start_step, "param_count": param_count, "nothing_to_train": True}
 
     # Mixed precision: fp16 autocast + grad scaler on CUDA, bf16 autocast on TPU
@@ -673,18 +673,18 @@ def train(cfg: TrainConfig) -> dict:
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # Gradient accumulation
-    accum_steps = max(1, cfg.grad_accum_steps)
+    accum_steps = max(1, cfg.schedule.grad_accum_steps)
 
     # training loop. Batches resume where this run's stream stopped: start_step steps of
     # accum_steps batches each.
     train_loader, val_loader = _make_loaders(
-        train_path, val_path, tokenizer, current_seq_len, cfg.batch_size,
-        getattr(cfg, "num_workers", 2),
+        train_path, val_path, tokenizer, current_seq_len, cfg.schedule.batch_size,
+        cfg.device.num_workers,
         dataset_type=dataset_type,
         instruction_data=instruction_data,
         world_size=world_size, ordinal=ordinal, is_tpu=is_tpu, device=device,
-        max_eval_batches=cfg.max_eval_batches,
-        seed=cfg.seed, start_batch=start_step * accum_steps,
+        max_eval_batches=cfg.schedule.max_eval_batches,
+        seed=cfg.schedule.seed, start_batch=start_step * accum_steps,
     )
     model.train()
     data_iter = iter(train_loader)
@@ -697,42 +697,42 @@ def train(cfg: TrainConfig) -> dict:
     if resumed_extras.get("scaler") is not None and use_amp:
         scaler.load_state_dict(resumed_extras["scaler"])
     t0 = time.time()
-    effective_batch = cfg.batch_size * accum_steps * world_size
+    effective_batch = cfg.schedule.batch_size * accum_steps * world_size
     if accum_steps > 1 and is_master:
         tqdm.write(f"Gradient accumulation: {accum_steps} steps (effective batch={effective_batch})")
-    fuse_step = is_tpu and getattr(cfg, "tpu_fuse_step", False)
-    tokens_per_step = effective_batch * cfg.seq_len
+    fuse_step = is_tpu and cfg.device.tpu_fuse_step
+    tokens_per_step = effective_batch * cfg.model.seq_len
     run_info = _run_info(cfg, ckpt_dir, resumed_state, start_step, tokens_per_step)
     run_info["scaler"] = scaler if use_amp else None  # saved with the optimizer
 
     # Wall-clock session cap. Each rank would read its own clock, so multi-process runs (xmp,
     # DDP) could disagree on the stopping step and deadlock; only one-process runs get it.
-    max_minutes = getattr(cfg, "max_train_minutes", 0) or 0
+    max_minutes = cfg.schedule.max_train_minutes or 0
     if max_minutes > 0 and world_size > 1:
         if is_master:
             tqdm.write("max_train_minutes ignored: multi-process run.")
         max_minutes = 0
-    end_step = cfg.max_steps
+    end_step = cfg.schedule.max_steps
     last_saved = start_step  # the final save is skipped when the last step was just saved
     done = start_step        # steps whose optimizer update has run
     t_log, step_log = time.time(), start_step
 
-    for step in tqdm(range(start_step, cfg.max_steps), initial=start_step, total=cfg.max_steps,
+    for step in tqdm(range(start_step, cfg.schedule.max_steps), initial=start_step, total=cfg.schedule.max_steps,
                      dynamic_ncols=True, disable=not is_master):
         try:
             # Curriculum: check if seq_len should change
             if curriculum:
-                target_seq_len = _get_curriculum_seq_len(curriculum, step, cfg.seq_len)
+                target_seq_len = _get_curriculum_seq_len(curriculum, step, cfg.model.seq_len)
                 if target_seq_len != current_seq_len:
                     current_seq_len = target_seq_len
                     train_loader, val_loader = _make_loaders(
-                        train_path, val_path, tokenizer, current_seq_len, cfg.batch_size,
-                        getattr(cfg, "num_workers", 2),
+                        train_path, val_path, tokenizer, current_seq_len, cfg.schedule.batch_size,
+                        cfg.device.num_workers,
                         dataset_type=dataset_type,
                         instruction_data=instruction_data,
                         world_size=world_size, ordinal=ordinal, is_tpu=is_tpu, device=device,
-                        max_eval_batches=cfg.max_eval_batches,
-                        seed=cfg.seed, start_batch=step * accum_steps,
+                        max_eval_batches=cfg.schedule.max_eval_batches,
+                        seed=cfg.schedule.seed, start_batch=step * accum_steps,
                     )
                     data_iter = iter(train_loader)
                     if is_master:
@@ -774,17 +774,17 @@ def train(cfg: TrainConfig) -> dict:
                         scaler.scale(loss).backward()
 
             if is_tpu:
-                if cfg.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                if cfg.schedule.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.schedule.grad_clip)
                 if world_size > 1:
                     xm.optimizer_step(optimizer)  # all-reduce grads across cores, step, mark
                 else:
                     optimizer.step()
                     xm.mark_step()
             else:
-                if cfg.grad_clip > 0:
+                if cfg.schedule.grad_clip > 0:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.schedule.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
             scheduler.step()
@@ -796,7 +796,7 @@ def train(cfg: TrainConfig) -> dict:
             loss = loss * accum_steps
 
             # logging
-            if (step + 1) % cfg.log_every == 0 and is_master:
+            if (step + 1) % cfg.schedule.log_every == 0 and is_master:
                 train_loss = loss.item()  # host sync: the step's work is done after this
                 now = time.time()
                 elapsed = now - t0
@@ -817,8 +817,8 @@ def train(cfg: TrainConfig) -> dict:
                 )
 
             # eval — every core evaluates its shard, then we average across cores
-            if (step + 1) % cfg.eval_every == 0:
-                val_loss = evaluate(model, val_loader, device, cfg.max_eval_batches)
+            if (step + 1) % cfg.schedule.eval_every == 0:
+                val_loss = evaluate(model, val_loader, device, cfg.schedule.max_eval_batches)
                 if world_size > 1:
                     val_loss = _reduce_mean(val_loss, is_tpu, device)
                 entry = {"step": step + 1, "val_loss": val_loss}
@@ -826,7 +826,7 @@ def train(cfg: TrainConfig) -> dict:
                     entry["val_metric"] = val_metric
                 note = ""
                 if val_old_loader is not None:
-                    val_old = evaluate(model, val_old_loader, device, cfg.max_eval_batches)
+                    val_old = evaluate(model, val_old_loader, device, cfg.schedule.max_eval_batches)
                     if world_size > 1:
                         val_old = _reduce_mean(val_old, is_tpu, device)
                     entry["val_old_loss"] = val_old
@@ -834,7 +834,7 @@ def train(cfg: TrainConfig) -> dict:
                 _record(entry)
                 if is_master:
                     tqdm.write(f"step {step + 1:>5d} | val_loss {val_loss:.4f}{note}")
-                min_delta = getattr(cfg, "early_stop_min_delta", 0.0)
+                min_delta = cfg.schedule.early_stop_min_delta
                 # best.pt: overwrite on ANY all-time improvement. min_delta is an
                 # early-stopping threshold ("is progress still worth the compute?") and
                 # must not gate checkpoint selection too — at min_delta=0.01 a genuinely
@@ -859,7 +859,7 @@ def train(cfg: TrainConfig) -> dict:
                     evals_since_improve += 1
                 model.train()
 
-                patience = getattr(cfg, "early_stop_patience", 0)
+                patience = cfg.schedule.early_stop_patience
                 if patience > 0 and evals_since_improve >= patience:
                     if is_master:
                         tqdm.write(
@@ -876,10 +876,10 @@ def train(cfg: TrainConfig) -> dict:
                     }
 
             # checkpoint
-            if (step + 1) % cfg.checkpoint_every == 0 and (is_tpu or is_master):
+            if (step + 1) % cfg.schedule.checkpoint_every == 0 and (is_tpu or is_master):
                 _save_checkpoint(
                     run_info, model, optimizer, scheduler, step + 1, ckpt_dir, is_tpu=is_tpu, is_master=is_master,
-                    keep_last=getattr(cfg, "checkpoint_keep_last", 2),
+                    keep_last=cfg.schedule.checkpoint_keep_last,
                 )
                 last_saved = step + 1
 
@@ -893,7 +893,7 @@ def train(cfg: TrainConfig) -> dict:
                 )
                 last_saved = step + 1
 
-            if max_minutes > 0 and (time.time() - t0) / 60 >= max_minutes and step + 1 < cfg.max_steps:
+            if max_minutes > 0 and (time.time() - t0) / 60 >= max_minutes and step + 1 < cfg.schedule.max_steps:
                 end_step = step + 1
                 if is_master:
                     tqdm.write(f"max_train_minutes={max_minutes:g} reached at step {end_step}: "
@@ -910,16 +910,16 @@ def train(cfg: TrainConfig) -> dict:
             if done != last_saved:
                 _save_checkpoint(run_info, model, optimizer, scheduler, done, ckpt_dir,
                                  is_tpu=is_tpu, is_master=is_master,
-                                 keep_last=getattr(cfg, "checkpoint_keep_last", 2))
+                                 keep_last=cfg.schedule.checkpoint_keep_last)
             return {"interrupted_at_step": done, "steps": done, "param_count": param_count}
 
     # final checkpoint + eval
-    val_loss = evaluate(model, val_loader, device, cfg.max_eval_batches)
+    val_loss = evaluate(model, val_loader, device, cfg.schedule.max_eval_batches)
     if world_size > 1:
         val_loss = _reduce_mean(val_loss, is_tpu, device)
     if (is_tpu or is_master) and end_step != last_saved:
         _save_checkpoint(run_info, model, optimizer, scheduler, end_step, ckpt_dir, is_tpu=is_tpu, is_master=is_master,
-                         keep_last=getattr(cfg, "checkpoint_keep_last", 2))
+                         keep_last=cfg.schedule.checkpoint_keep_last)
 
     return {
         "final_val_loss": val_loss,
@@ -941,12 +941,12 @@ def _prebuild_text_cache(cfg: TrainConfig) -> None:
     Each worker would otherwise build the same memmap cache concurrently, and one
     process truncating the file while another reads it faults with SIGBUS.
     """
-    if getattr(cfg, "dataset_type", "text") != "text":
+    if cfg.data.dataset_type != "text":
         return  # instruction/chat datasets tokenize in-memory, no shared cache file
-    tokenizer = load_tokenizer(Path(cfg.tokenizer_path))
-    for path in (cfg.train_path, cfg.val_path):
+    tokenizer = load_tokenizer(Path(cfg.data.tokenizer_path))
+    for path in (cfg.data.train_path, cfg.data.val_path):
         if path:
-            TextDataset(Path(path), tokenizer, cfg.seq_len)
+            TextDataset(Path(path), tokenizer, cfg.model.seq_len)
 
 
 def train_multicore(cfg: TrainConfig) -> None:
@@ -959,7 +959,7 @@ def train_multicore(cfg: TrainConfig) -> None:
     """
     import os
 
-    if os.environ.get("AION_TPU_WORKER") == "1" and getattr(cfg, "tpu_spmd", False):
+    if os.environ.get("AION_TPU_WORKER") == "1" and cfg.device.tpu_spmd:
         # One process, one compile for all chips. xmp.spawn's 8 processes each compile the
         # full 235M fwd+bwd graph at once, and that host-RAM spike is the BrokenProcessPool.
         import torch_xla.runtime as xr
@@ -1022,7 +1022,7 @@ def _ddp_worker(rank: int, world_size: int, cfg: TrainConfig) -> None:
     # Each rank loads the full checkpoint on CPU during resume; DataLoader worker procs
     # would add more host-RAM pressure on top. Load data in-process to avoid OOM (memmap
     # dataset means no data copy anyway).
-    cfg.num_workers = 0
+    cfg.device.num_workers = 0
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     try:
@@ -1036,7 +1036,7 @@ def train_ddp(cfg: TrainConfig) -> None:
     """Data-parallel training across CUDA GPUs via DistributedDataParallel (NCCL)."""
     import torch.multiprocessing as mp
     n = torch.cuda.device_count()
-    requested = getattr(cfg, "gpus", 1)
+    requested = cfg.device.gpus
     world_size = n if requested in (0, -1) else min(requested, n)
     if world_size <= 1:
         train(cfg)

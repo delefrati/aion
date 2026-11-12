@@ -127,9 +127,9 @@ def cmd_train(args):
     from llm_lab.training import trainer
 
     cfg = TrainConfig.load(Path(args.config))
-    print(f"Training {cfg.model_type} for {cfg.max_steps} steps...")
-    cores = getattr(cfg, "tpu_cores", 1)
-    gpus = getattr(cfg, "gpus", 1)
+    print(f"Training {cfg.model.model_type} for {cfg.schedule.max_steps} steps...")
+    cores = cfg.device.tpu_cores
+    gpus = cfg.device.gpus
     if trainer.HAS_XLA and cores != 1:
         trainer.train_multicore(cfg)
         print("Done (multi-core TPU run — see master logs above).")
@@ -163,9 +163,9 @@ def cmd_eval(args):
     model, state = checkpoint.load_model(args.checkpoint, device, _config_arg(args))
     cfg = checkpoint.config_from_state(state, _config_arg(args))
     tok = checkpoint.tokenizer_path(args.checkpoint, args.tokenizer)
-    val = Path(args.val) if args.val else Path(cfg.val_path)
+    val = Path(args.val) if args.val else Path(cfg.data.val_path)
 
-    ppl = perplexity(model, val, tok, cfg.seq_len)
+    ppl = perplexity(model, val, tok, cfg.model.seq_len)
     print(f"Perplexity on val set: {ppl:.2f}")
 
 
@@ -191,7 +191,7 @@ def cmd_bench(args):
         label = label or Path(path).stem
         model, state = checkpoint.load_model(path, device, cfg)
         step = int(state.get("step", 0))
-        seq_len = checkpoint.config_from_state(state, cfg).seq_len
+        seq_len = checkpoint.config_from_state(state, cfg).model.seq_len
         tokenizer = load_tokenizer(checkpoint.tokenizer_path(path, args.tokenizer))
         entry = {"checkpoint": path, "step": step, "limit": args.limit, "tasks": {}}
         print(f"== {label}: {path} @ step {step:,} on {device}")
@@ -255,14 +255,14 @@ def cmd_finetune(args):
     from llm_lab.training import checkpoint, trainer
 
     cfg = TrainConfig.load(Path(args.config))
-    if getattr(cfg, "dataset_type", "text") == "text":
-        cfg.dataset_type = "instruction"
+    if cfg.data.dataset_type == "text":
+        cfg.data.dataset_type = "instruction"
     if args.data:
-        cfg.instruction_data = args.data
+        cfg.data.instruction_data = args.data
 
-    ckpt_dir = Path(cfg.checkpoint_dir)
+    ckpt_dir = Path(cfg.data.checkpoint_dir)
     has_latest = checkpoint.find(ckpt_dir) is not None
-    pretrain = args.pretrain or cfg.pretrain_checkpoint
+    pretrain = args.pretrain or cfg.data.pretrain_checkpoint
     if not has_latest and pretrain and Path(pretrain).exists():
         trainer.seed_checkpoint(pretrain, ckpt_dir)
         print(f"Seeded fine-tune start from {pretrain} (fresh optimizer)")

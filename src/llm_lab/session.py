@@ -335,7 +335,7 @@ def run_bench(spec: SessionSpec) -> dict:
         torch.set_num_threads(os.cpu_count() or 1)
     ref = checkpoint.find(spec.ckpt_dir)
     model, state = checkpoint.load_model(ref.weights, device)
-    seq_len = checkpoint.config_from_state(state).seq_len
+    seq_len = checkpoint.config_from_state(state).model.seq_len
     tokenizer = load_tokenizer(checkpoint.tokenizer_path(ref.weights))
     print(f"{spec.name}: phase done at step {state['step']:,}; benchmarking {ref.weights.name} "
           f"on {device} ({', '.join(spec.bench)})...", flush=True)

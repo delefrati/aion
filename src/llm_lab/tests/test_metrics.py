@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import json
-import shutil
-from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -37,7 +35,7 @@ def test_a_line_cut_short_is_skipped_and_ended(tmp_path):
 
 def test_training_writes_jsonl_not_into_the_checkpoint(tiny_cfg):
     trainer.train(tiny_cfg)
-    d = Path(tiny_cfg.checkpoint_dir)
+    d = Path(tiny_cfg.data.checkpoint_dir)
     assert not (d / "metrics.json").exists()
     log = metrics.read(d / metrics.FILE)
     assert _train_steps(log) == [1, 2, 3, 4, 5, 6]
@@ -46,13 +44,13 @@ def test_training_writes_jsonl_not_into_the_checkpoint(tiny_cfg):
 
 
 def test_rolled_back_checkpoint_resumes_without_abandoned_steps(tiny_cfg):
-    cfg = replace(tiny_cfg, checkpoint_keep_last=2)
+    cfg = tiny_cfg.replace(checkpoint_keep_last=2)
     trainer.train(cfg)  # checkpoints at 3 and 6
-    d = Path(cfg.checkpoint_dir)
+    d = Path(cfg.data.checkpoint_dir)
     checkpoint.set_marker(d, "latest", 3)  # roll latest back to step 3
     assert checkpoint.read_state(checkpoint.find(d))["step"] == 3
 
-    result = trainer.train(replace(cfg, max_steps=5))
+    result = trainer.train(cfg.replace(max_steps=5))
     assert result["steps"] == 5
     log = metrics.read(d / metrics.FILE)
     assert _train_steps(log) == [1, 2, 3, 4, 5]  # step 6 belonged to the abandoned branch
@@ -61,7 +59,7 @@ def test_rolled_back_checkpoint_resumes_without_abandoned_steps(tiny_cfg):
 
 
 def test_an_old_checkpoints_history_moves_to_jsonl(tiny_cfg):
-    d = Path(tiny_cfg.checkpoint_dir)
+    d = Path(tiny_cfg.data.checkpoint_dir)
     _legacy_checkpoint(tiny_cfg, d / "latest.pt", step=4)  # carries a step-4 entry
     (d / "metrics.json").write_text(json.dumps([{"step": 4, "train_loss": 3.0}]))
     trainer.train(tiny_cfg)

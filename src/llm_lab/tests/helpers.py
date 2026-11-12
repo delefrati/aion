@@ -13,7 +13,7 @@ def legacy_checkpoint(cfg, path: Path, step: int) -> dict:
     """An old-style latest.pt, as the trainer wrote it before AION-8."""
     torch.manual_seed(1)
     model = build_model(cfg)
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.schedule.lr)
     model(torch.zeros(1, 4, dtype=torch.long)).sum().backward()
     opt.step()
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 1.0)

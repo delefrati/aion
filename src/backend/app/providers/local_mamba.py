@@ -42,7 +42,7 @@ class LocalMambaProvider(BaseProvider):
                 raise ValueError("Checkpoint has no embedded config; set AION_MAMBA_CONFIG_PATH")
             cfg_dict = yaml.safe_load(Path(config_path).read_text())
 
-        cfg = TrainConfig.from_dict(cfg_dict)
+        cfg = TrainConfig.from_dict(cfg_dict, strict=False)  # saved with the model by some version
 
         self.device = pick_device(device)
 
@@ -55,7 +55,7 @@ class LocalMambaProvider(BaseProvider):
         from app.config import settings
         self.max_tokens = settings.max_tokens_per_request
         # Trained context window; total (prompt + generated) must stay within this
-        self.context_len = getattr(cfg, "seq_len", self.max_tokens)
+        self.context_len = cfg.model.seq_len
         self.history_turns = settings.mamba_history_turns
         # 0.8 made the 235M chat model bury facts it knows (it named Paris only at low T);
         # 0.3 read as too deterministic. 0.4 keeps the facts and some variety.

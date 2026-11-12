@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import json
-import threading
 import time
-from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -44,7 +42,7 @@ class RecordingStore(LocalStore):
 def spec_for(tiny_cfg, corpus, tmp_path):
     """spec_for(store, **kw): a session of the tiny model on the tiny corpus."""
     def make(store, **kw):
-        cfg = {k: v for k, v in asdict(tiny_cfg).items() if k != "checkpoint_dir"}
+        cfg = {k: v for k, v in tiny_cfg.to_flat().items() if k != "checkpoint_dir"}
         kw.setdefault("work_dir", tmp_path / "work")
         return SessionSpec(name="tiny", store=store, config=cfg, target_steps=kw.pop("target_steps", 6),
                            bank_every=kw.pop("bank_every", 3600), **kw)
@@ -97,7 +95,7 @@ def test_seeding_from_an_old_pt_parent(spec_for, tiny_cfg, tmp_path):
     run_session(spec_for(child, start=True, parent=parent, steps=2))
     state = checkpoint.read_state(checkpoint.find(child.path))
     assert state["step"] == 2 and state["parent"]["step"] == 40
-    assert state["config"]["d_model"] == tiny_cfg.d_model  # loads with no YAML
+    assert state["config"]["model"]["d_model"] == tiny_cfg.model.d_model  # loads with no YAML
 
 
 def test_a_store_without_a_checkpoint_stops_the_session(spec_for, tmp_path):
@@ -208,14 +206,14 @@ def test_kaggle_sessions_like_the_tpu_notebook(fake_kaggle, tiny_cfg, corpus, tm
 
     tok = load_tokenizer(corpus["tokenizer"])
     for name in ("train", "val"):
-        TextDataset(corpus[name], tok, tiny_cfg.seq_len)  # writes train.bin / val.bin
+        TextDataset(corpus[name], tok, tiny_cfg.model.seq_len)  # writes train.bin / val.bin
     kaggle("data").push([corpus["dir"] / n for n in ("train.bin", "val.bin", "tokenizer.json")])
     parent_src = tmp_path / "parent_src"
     legacy_checkpoint(tiny_cfg, parent_src / "latest.pt", step=20000)
     (parent_src / "tokenizer.json").write_bytes(corpus["tokenizer"].read_bytes())
     kaggle("parent").push(sorted(parent_src.iterdir()))
 
-    cfg = {k: v for k, v in asdict(tiny_cfg).items()
+    cfg = {k: v for k, v in tiny_cfg.to_flat().items()
            if k not in ("checkpoint_dir", "train_path", "val_path", "tokenizer_path")}
 
     def spec(**kw):
@@ -228,7 +226,7 @@ def test_kaggle_sessions_like_the_tpu_notebook(fake_kaggle, tiny_cfg, corpus, tm
     pushed = fake_kaggle.dataset("me/phase2")
     state = json.loads((pushed / "step_3.state.json").read_text())
     assert state["parent"]["step"] == 20000 and state["data"]["id"] == "kaggle:me/data"
-    assert state["config"]["train_path"].endswith("train.txt")
+    assert state["config"]["data"]["train_path"].endswith("train.txt")
 
     r = run_session(spec())
     assert (r.start_step, r.end_step, r.phase_done) == (3, 6, True)
@@ -277,9 +275,9 @@ def test_a_bench_the_last_session_missed_runs_next_session(spec_for, toy_bench, 
 
 def test_text_configs_cannot_early_stop(tiny_cfg):
     with pytest.raises(ValueError, match="early_stop_patience"):
-        trainer.train(replace(tiny_cfg, early_stop_patience=3))
+        trainer.train(tiny_cfg.replace(early_stop_patience=3))
 
 
 def test_finetuning_still_keeps_a_best(chat_cfg):
     trainer.train(chat_cfg)
-    assert checkpoint.find(chat_cfg.checkpoint_dir, "best") is not None
+    assert checkpoint.find(chat_cfg.data.checkpoint_dir, "best") is not None

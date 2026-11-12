@@ -3,8 +3,6 @@ mid-run, end with the same weights, step and metrics as one uninterrupted run.""
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, replace
-from pathlib import Path
 
 import pytest
 import torch
@@ -18,7 +16,7 @@ TARGET = 12
 
 
 def _spec(cfg, store, work, **kw) -> SessionSpec:
-    config = {k: v for k, v in asdict(cfg).items() if k != "checkpoint_dir"}
+    config = {k: v for k, v in cfg.to_flat().items() if k != "checkpoint_dir"}
     return SessionSpec(name="resume", store=store, config=config, target_steps=TARGET,
                        work_dir=work, bank_every=3600, **kw)
 
@@ -52,7 +50,7 @@ def _three_sessions(cfg, tmp_path) -> LocalStore:
 @pytest.fixture
 def cfg(tiny_cfg):
     # Dropout on, so the RNG must resume too; a checkpoint every 2 steps.
-    return replace(tiny_cfg, dropout=0.1, checkpoint_every=2, eval_every=4, max_steps=TARGET)
+    return tiny_cfg.replace(dropout=0.1, checkpoint_every=2, eval_every=4, max_steps=TARGET)
 
 
 def test_killed_and_resumed_matches_uninterrupted(cfg, tmp_path):
