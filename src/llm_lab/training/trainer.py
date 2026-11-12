@@ -648,6 +648,16 @@ def train(cfg: TrainConfig) -> dict:
     # or a resumed run would compare its loss against the old one-document number.
     val_metric = TEXT_VAL_METRIC if dataset_type == "text" else None
 
+    # Pretraining (text) is single-pass: each eval sees a model that has read new text since
+    # the last, and the late gains are smaller than val's noise on a slice. A best checkpoint
+    # then lands on a step by luck, and early stopping can only cut a run short. So text runs
+    # keep just their latest checkpoints and are judged by the benchmark at the phase's end
+    # (llm_lab.session); best and early stopping are for finetuning.
+    single_pass = dataset_type == "text"
+    if single_pass and getattr(cfg, "early_stop_patience", 0) > 0:
+        raise ValueError("early_stop_patience is for finetuning; pretraining (dataset_type "
+                         "'text') runs its whole budget. Remove it from the config.")
+
     def _comparable(entry: dict) -> bool:
         return "val_loss" in entry and entry.get("val_metric") == val_metric
 
@@ -835,7 +845,7 @@ def train(cfg: TrainConfig) -> dict:
                 # must not gate checkpoint selection too — at min_delta=0.01 a genuinely
                 # better eval that improves by less is discarded, leaving best.pt on a
                 # worse step than one the run actually reached.
-                if val_loss < best_val_loss:
+                if not single_pass and val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_step = step + 1
                     if is_tpu or is_master:

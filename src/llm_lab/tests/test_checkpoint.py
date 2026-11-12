@@ -36,9 +36,8 @@ def test_training_writes_the_new_format(tiny_cfg, corpus):
     assert state["data"]["files"]["train.bin"] > 0
     assert state["has_optimizer"] is True
     assert state["tied"] == {"lm_head.weight": "embedding.weight"}
-    # keep_last=1: the latest, and the best (weights only) the evals found.
-    best = json.loads((d / "BEST").read_text())["step"]
-    assert set(checkpoint.steps_on_disk(d)) == {6, best}
+    # keep_last=1: only the latest. A pretraining run keeps no best (AION-13).
+    assert checkpoint.steps_on_disk(d) == [6] and not (d / "BEST").exists()
 
 
 def test_load_model_needs_no_config(tiny_cfg):

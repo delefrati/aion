@@ -23,6 +23,10 @@ What a session does:
    recorded as done; the checkpoint is also mirrored to spec.fallback_dir, if set.
 5. Push once more at the end, if this session got further than the store already has.
    A session that made no progress pushes nothing.
+6. When the session reaches the budget, score the final checkpoint on the zero-shot
+   benchmarks (spec.bench) and push bench.json with it. A pretraining phase keeps no best
+   checkpoint, so this is how it's judged. If the session dies first, the next one (which
+   finds the budget spent) runs the bench instead.
 """
 from __future__ import annotations
 
@@ -68,6 +72,10 @@ class SessionSpec:
     bank_every: float = 120            # seconds between background bank checks
     fallback_dir: Path | None = None   # mirror of the checkpoint when a push fails
     overrides: dict = field(default_factory=dict)  # last-word config changes for this session
+    bench: tuple[str, ...] = ()        # tasks to score the final checkpoint on at the phase end
+    bench_limit: int = 0               # questions per task; 0 = all
+    bench_batch_size: int = 32
+    output_dir: Path | None = None     # also gets bench.json (Kaggle: /kaggle/working)
     python: str = sys.executable
 
     @property
@@ -196,7 +204,9 @@ def session_config(spec: SessionSpec, start_step: int) -> dict | None:
 
 # --- banking --------------------------------------------------------------------------------
 
-EXTRAS = ("tokenizer.json", "run.yaml")
+BENCH_FILE = "bench.json"
+EXTRAS = ("tokenizer.json", "run.yaml", BENCH_FILE)
+DEFAULT_BENCH = ("hellaswag", "arc_easy", "arc_challenge", "piqa")
 
 
 def snapshot(ckpt_dir: Path, dest: Path, attempts: int = 5) -> int | None:
@@ -244,11 +254,12 @@ class Banker:
         self.fail_streak = 0
         self.retry_after = 0.0
 
-    def bank(self, why: str) -> bool:
-        """Push if there is something newer. True when the store is up to date afterwards."""
+    def bank(self, why: str, force: bool = False) -> bool:
+        """Push if there is something newer (or, with force, the same step again, e.g. with
+        bench.json added). True when the store is up to date afterwards."""
         with self.lock:
             step = snapshot(self.spec.ckpt_dir, self.stage)
-            if step is None or (self.pushed is not None and step <= self.pushed):
+            if step is None or (not force and self.pushed is not None and step <= self.pushed):
                 return True
             print(f"[bank] {why}: pushing step {step:,} to {self.spec.store}...", flush=True)
             try:
@@ -301,6 +312,51 @@ class Banker:
                 print(f"[bank] skipped this cycle: {e}", flush=True)
 
 
+# --- the phase-end bench ----------------------------------------------------------------------
+
+def _bench_done(spec: SessionSpec, step: int) -> bool:
+    f = spec.ckpt_dir / BENCH_FILE
+    if not f.exists():
+        return False
+    done = json.loads(f.read_text())
+    return done.get("step") == step and set(spec.bench) <= set(done.get("tasks", {}))
+
+
+def run_bench(spec: SessionSpec) -> dict:
+    """Score the latest checkpoint on spec.bench; write bench.json beside it (and in
+    output_dir). CUDA if there is one, else the CPU: the TPU belongs to training."""
+    import torch
+    from llm_lab.eval.benchmarks import format_table, run_task
+    from llm_lab.tokenizer.bpe import load_tokenizer
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cpu":
+        torch.set_num_threads(os.cpu_count() or 1)
+    ref = checkpoint.find(spec.ckpt_dir)
+    model, state = checkpoint.load_model(ref.weights, device)
+    seq_len = checkpoint.config_from_state(state).seq_len
+    tokenizer = load_tokenizer(checkpoint.tokenizer_path(ref.weights))
+    print(f"{spec.name}: phase done at step {state['step']:,}; benchmarking {ref.weights.name} "
+          f"on {device} ({', '.join(spec.bench)})...", flush=True)
+    result = {"run": spec.name, "checkpoint": ref.weights.name, "step": state["step"],
+              "limit": spec.bench_limit, "tasks": {}}
+    for task in spec.bench:
+        result["tasks"][task] = run_task(model, tokenizer, task, seq_len, device,
+                                         batch_size=spec.bench_batch_size, limit=spec.bench_limit)
+    body = json.dumps(result, indent=2)
+    (spec.ckpt_dir / BENCH_FILE).write_text(body)
+    if spec.output_dir is not None:
+        Path(spec.output_dir).mkdir(parents=True, exist_ok=True)
+        (Path(spec.output_dir) / BENCH_FILE).write_text(body)
+    print(format_table({f"{spec.name}-{state['step']}": result}), flush=True)
+    return result
+
+
+def _bench_and_push(spec: SessionSpec, banker: "Banker") -> None:
+    run_bench(spec)
+    if spec.push and not banker.bank("bench results", force=True):
+        raise PushError(f"bench.json for step {banker.pushed} couldn't be pushed to {spec.store}.")
+
+
 # --- the session ----------------------------------------------------------------------------
 
 def train(spec: SessionSpec, cfg: dict, on_line=None) -> int:
@@ -340,6 +396,8 @@ def run_session(spec: SessionSpec, on_line=None) -> SessionResult:
     cfg = session_config(spec, start)
     if cfg is None:
         print(f"{spec.name}: budget reached ({start:,}/{spec.target_steps:,} steps): nothing to train.")
+        if spec.bench and spec.push and not _bench_done(spec, start):
+            _bench_and_push(spec, Banker(spec, pushed))  # the session that finished died first
         return SessionResult(start, start, pushed, 0, True)
     fetch_data(spec)
     print(f"{spec.name}: training steps {start:,} -> {cfg['max_steps']:,} of {spec.target_steps:,}"
@@ -378,4 +436,6 @@ def run_session(spec: SessionSpec, on_line=None) -> SessionResult:
     if rc != 0:
         raise RuntimeError(f"Training exited with code {rc} at step {end:,} "
                            f"(store holds {result.pushed_step}).")
+    if result.phase_done and spec.bench and spec.push and not _bench_done(spec, end):
+        _bench_and_push(spec, banker)
     return result

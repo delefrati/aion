@@ -234,3 +234,52 @@ def test_kaggle_sessions_like_the_tpu_notebook(fake_kaggle, tiny_cfg, corpus, tm
     assert (r.start_step, r.end_step, r.phase_done) == (3, 6, True)
     assert json.loads((pushed / "COMPLETE").read_text())["step"] == 6
     assert not any(c["token"] for c in fake_kaggle.calls())
+
+
+@pytest.fixture
+def toy_bench(monkeypatch):
+    """A one-question benchmark in place of the HF ones: nothing downloads."""
+    from llm_lab.eval import benchmarks
+    item = benchmarks.Item(context="the cat sat on", choices=[" the mat", " blue"], label=0)
+    monkeypatch.setitem(benchmarks.TASKS, "toy", lambda: [item] * 3)
+    monkeypatch.setitem(benchmarks.HEADLINE, "toy", "acc")
+    monkeypatch.setitem(benchmarks.CHANCE, "toy", 0.5)
+    return ("toy",)
+
+
+def test_pretraining_keeps_no_best_and_benches_at_phase_end(spec_for, toy_bench, tmp_path):
+    """AION-13: a text run writes no BEST, and the session that finishes the phase scores
+    its last checkpoint and pushes bench.json with it."""
+    store = RecordingStore(tmp_path / "store")
+    run_session(spec_for(store, start=True, steps=3, bench=toy_bench))
+    assert not (store.path / "BEST").exists() and "bench.json" not in store.files()
+
+    run_session(spec_for(store, bench=toy_bench, output_dir=tmp_path / "out"))
+    assert not (store.path / "BEST").exists()
+    bench = json.loads((store.path / "bench.json").read_text())
+    assert bench["step"] == 6 and bench["checkpoint"] == "step_6.safetensors"
+    assert bench["tasks"]["toy"]["n"] == 3
+    assert json.loads((tmp_path / "out" / "bench.json").read_text()) == bench
+    assert store.pushes == [3, 6, 6]  # the checkpoint, then again with bench.json
+
+
+def test_a_bench_the_last_session_missed_runs_next_session(spec_for, toy_bench, tmp_path):
+    store = RecordingStore(tmp_path / "store")
+    run_session(spec_for(store, start=True))  # finished the phase without benching
+    assert "bench.json" not in store.files()
+    store.pushes.clear()
+    r = run_session(spec_for(store, bench=toy_bench))
+    assert r.phase_done and json.loads((store.path / "bench.json").read_text())["step"] == 6
+    store.pushes.clear()
+    run_session(spec_for(store, bench=toy_bench))  # already benched: nothing more to do
+    assert store.pushes == []
+
+
+def test_text_configs_cannot_early_stop(tiny_cfg):
+    with pytest.raises(ValueError, match="early_stop_patience"):
+        trainer.train(replace(tiny_cfg, early_stop_patience=3))
+
+
+def test_finetuning_still_keeps_a_best(chat_cfg):
+    trainer.train(chat_cfg)
+    assert checkpoint.find(chat_cfg.checkpoint_dir, "best") is not None

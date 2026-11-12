@@ -47,6 +47,17 @@ def tiny_cfg(corpus, tmp_path):
     )
 
 
+@pytest.fixture
+def chat_cfg(tiny_cfg, tmp_path):
+    """The tiny model finetuning on a tiny chat set: a run that keeps a best checkpoint."""
+    import json
+    from dataclasses import replace
+    chat = tmp_path / "chat.json"
+    chat.write_text(json.dumps([{"messages": [{"role": "user", "content": "the cat"},
+                                              {"role": "assistant", "content": "sat on the mat"}]}] * 40))
+    return replace(tiny_cfg, dataset_type="chat", instruction_data=str(chat), train_path="", val_path="")
+
+
 class FakeKaggle:
     """The fake kaggle CLI (tests/fake_kaggle.py) on PATH, with its Datasets in a temp dir."""
 

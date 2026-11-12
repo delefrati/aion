@@ -34,5 +34,3 @@ checkpoint_every: 250
 eval_every: 100
 log_every: 50
 max_eval_batches: 20
-early_stop_patience: 25
-early_stop_min_delta: 0.01

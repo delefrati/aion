@@ -51,4 +51,3 @@ checkpoint_keep_last: 0
 eval_every: 1000
 log_every: 50
 max_eval_batches: 32   # x 64 = 2048 non-overlapping windows (~2.1M tokens) spread over val.bin
-early_stop_patience: 0 # a flat-LR phase isn't expected to keep improving val every eval

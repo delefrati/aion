@@ -68,9 +68,9 @@ def test_kill_mid_save_keeps_the_previous_checkpoint(tiny_cfg, tmp_path, victim)
     assert not list(d.glob(f"*{checkpoint.TMP}"))
 
 
-def test_banked_lists_latest_best_and_markers(tiny_cfg):
-    trainer.train(tiny_cfg)
-    d = Path(tiny_cfg.checkpoint_dir)
+def test_banked_lists_latest_best_and_markers(chat_cfg):
+    trainer.train(chat_cfg)
+    d = Path(chat_cfg.checkpoint_dir)
     step, files = checkpoint.banked(d)
     best = checkpoint.read_marker(d, "best")["step"]
     names = {f.name for f in files}
