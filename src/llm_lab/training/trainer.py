@@ -38,6 +38,8 @@ from tqdm import tqdm
 from llm_lab.data.dataset import TextDataset
 from llm_lab.data.instruction import InstructionDataset, MultiTurnDataset, collate_instruction
 from llm_lab.tokenizer.bpe import load_tokenizer
+from llm_lab.training import checkpoint
+from llm_lab.training.checkpoint import strip_prefixes as _strip_prefixes
 from llm_lab.training.config import TrainConfig
 from llm_lab.training.model_factory import build_model  # noqa: F401
 
@@ -410,25 +412,27 @@ def _make_scheduler(cfg: TrainConfig, optimizer):
 
 
 def _resume_if_available(cfg: TrainConfig, model, optimizer, scheduler, ckpt_dir: Path,
-                         device: torch.device, is_master: bool) -> tuple[int, list[dict]]:
-    """Resume from latest.pt if present. Returns (start_step, metrics_log)."""
-    latest_ckpt = ckpt_dir / "latest.pt"
-    if not latest_ckpt.exists():
-        return 0, []
+                         device: torch.device, is_master: bool) -> tuple[int, list[dict], dict]:
+    """Resume from the latest checkpoint if there is one (new format, else an old latest.pt).
+    Returns (start_step, metrics_log, its state)."""
+    ref = checkpoint.find(ckpt_dir)
+    if ref is None:
+        return 0, [], {}
 
     # Load on CPU: storages saved from an XLA device are tagged "xla:0" and can't be
     # restored directly onto an XLA device. load_state_dict then copies onto `device`.
-    ckpt = torch.load(latest_ckpt, map_location="cpu", weights_only=False)
+    state = checkpoint.read_state(ref)
     # Load into the unwrapped model (DataParallel wraps as .module)
     target = model.module if hasattr(model, "module") else model
-    incompat = target.load_state_dict(_strip_prefixes(ckpt["model"]), strict=False)
+    incompat = target.load_state_dict(checkpoint.read_weights(ref), strict=False)
     if is_master and (incompat.missing_keys or incompat.unexpected_keys):
         tqdm.write(f"WARNING: checkpoint/model key mismatch — missing={list(incompat.missing_keys)[:4]} "
                    f"unexpected={list(incompat.unexpected_keys)[:4]} (architecture may differ from checkpoint)")
+    training = checkpoint.read_training(ref)
     reset_opt = getattr(cfg, "reset_optimizer", False)
-    if ckpt.get("optimizer") is not None and not reset_opt:
+    if training["optimizer"] is not None and not reset_opt:
         try:
-            optimizer.load_state_dict(ckpt["optimizer"])
+            optimizer.load_state_dict(training["optimizer"])
         except (ValueError, KeyError, RuntimeError) as e:
             # Mismatched optimizer types (e.g. resuming a standard-AdamW checkpoint under
             # 8-bit AdamW) — keep training rather than crash, but warn: moments reset.
@@ -440,32 +444,61 @@ def _resume_if_available(cfg: TrainConfig, model, optimizer, scheduler, ckpt_dir
                 for k, v in opt_state.items():
                     if isinstance(v, torch.Tensor):
                         opt_state[k] = v.to(device)
-    if ckpt.get("scheduler") is not None and not reset_opt:
-        scheduler.load_state_dict(ckpt["scheduler"])
-    step = ckpt["step"]
+    if training["scheduler"] is not None and not reset_opt:
+        scheduler.load_state_dict(training["scheduler"])
+    step = state["step"]
     # Drop history from beyond the resumed step. A checkpoint rolled back to an earlier step
     # keeps the whole metrics_log, so the log can describe steps these weights never reached.
     # Everything downstream that asks "how far along are we?" by taking max(step) over
     # metrics.json then reads a counter stuck in the future — including the notebooks'
     # auto-push watcher, which goes silent for the rest of the run because the counter never
     # advances past what it already banked.
-    _full_log = ckpt.get("metrics_log", [])
+    _full_log = training["metrics_log"] or []
     metrics_log = [e for e in _full_log if e.get("step", 0) <= step]
     _dropped = len(_full_log) - len(metrics_log)
-    fresh = ckpt.get("optimizer") is None or reset_opt
-    # Free the ~2.8GB checkpoint from host RAM before the first step (the CPU copy is no
-    # longer needed once weights + optimizer state are on the device).
-    del ckpt
+    fresh = training["optimizer"] is None or reset_opt
+    # Free the checkpoint from host RAM before the first step (the CPU copy is no longer
+    # needed once weights + optimizer state are on the device).
+    del training
     import gc as _gc
     _gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
     if is_master:
-        tqdm.write(f"Resumed from step {step}"
+        tqdm.write(f"Resumed from step {step} ({ref.weights.name})"
                    + (" (fresh optimizer — clean fine-tune start)" if fresh else "")
                    + (f"; dropped {_dropped} metrics entries from beyond step {step}"
                       if _dropped else ""))
-    return step, metrics_log
+    return step, metrics_log, state
+
+
+def _run_info(cfg: TrainConfig, ckpt_dir: Path, resumed: dict, start_step: int,
+              tokens_per_step: int) -> dict:
+    """What every checkpoint of this session records in its state.json besides the step."""
+    from dataclasses import asdict
+    files = {}
+    for p in (cfg.train_path, cfg.val_path, getattr(cfg, "instruction_data", "")):
+        if p:
+            # Text runs read the token cache (.bin); the .txt may never have been downloaded.
+            f = Path(p).with_suffix(".bin") if Path(p).suffix == ".txt" else Path(p)
+            if f.is_file():
+                files[f.name] = f.stat().st_size
+    parent = resumed.get("parent")
+    if parent is None and (ckpt_dir / "base.json").is_file():
+        parent = json.loads((ckpt_dir / "base.json").read_text())  # written by the notebooks' seeding
+    tokens = resumed.get("tokens_seen")
+    return {
+        "config": asdict(cfg),
+        "tokenizer_sha256": checkpoint.file_sha256(cfg.tokenizer_path) if cfg.tokenizer_path else None,
+        "data": {"id": getattr(cfg, "data_id", "") or None, "files": files},
+        "parent": parent,
+        "start_step": start_step,
+        "start_tokens": tokens if tokens is not None else start_step * tokens_per_step,
+        # An old checkpoint never counted its tokens; from it on, the count assumes this
+        # session's tokens per step for the steps before it too.
+        "tokens_estimated": bool(resumed.get("tokens_estimated")) or (tokens is None and start_step > 0),
+        "tokens_per_step": tokens_per_step,
+    }
 
 
 def train(cfg: TrainConfig) -> dict:
@@ -570,9 +603,11 @@ def train(cfg: TrainConfig) -> dict:
     best_val_loss = float("inf")
     best_step = 0
     evals_since_improve = 0  # for early stopping
-    start_step, metrics_log = _resume_if_available(
+    start_step, metrics_log, resumed_state = _resume_if_available(
         cfg, model, optimizer, scheduler, ckpt_dir, device, is_master
     )
+    if is_master and cfg.tokenizer_path and not (ckpt_dir / "tokenizer.json").exists():
+        shutil.copy2(cfg.tokenizer_path, ckpt_dir / "tokenizer.json")  # a checkpoint dir stands alone
 
     if use_fsdp:
         model = _fsdp_wrap(model, optimizer, is_master)
@@ -630,6 +665,7 @@ def train(cfg: TrainConfig) -> dict:
         tqdm.write(f"Gradient accumulation: {accum_steps} steps (effective batch={effective_batch})")
     fuse_step = is_tpu and getattr(cfg, "tpu_fuse_step", False)
     tokens_per_step = effective_batch * cfg.seq_len
+    run_info = _run_info(cfg, ckpt_dir, resumed_state, start_step, tokens_per_step)
 
     # Wall-clock session cap. Each rank would read its own clock, so multi-process runs (xmp,
     # DDP) could disagree on the stopping step and deadlock; only one-process runs get it.
@@ -767,7 +803,7 @@ def train(cfg: TrainConfig) -> dict:
                     best_step = step + 1
                     if is_tpu or is_master:
                         _save_checkpoint(
-                            model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir,
+                            run_info, model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir,
                             is_tpu=is_tpu, best=True, best_val_loss=best_val_loss,
                             is_master=is_master,
                         )
@@ -789,7 +825,7 @@ def train(cfg: TrainConfig) -> dict:
                             f"{evals_since_improve} evals (best {best_val_loss:.4f} @ step {best_step})."
                         )
                     if is_tpu or is_master:
-                        _save_checkpoint(model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu, is_master=is_master)
+                        _save_checkpoint(run_info, model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu, is_master=is_master)
                     if is_master:
                         (ckpt_dir / "metrics.json").write_text(json.dumps(metrics_log, indent=2))
                     return {
@@ -802,7 +838,7 @@ def train(cfg: TrainConfig) -> dict:
             # checkpoint
             if (step + 1) % cfg.checkpoint_every == 0 and (is_tpu or is_master):
                 _save_checkpoint(
-                    model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu, is_master=is_master,
+                    run_info, model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu, is_master=is_master,
                     keep_last=getattr(cfg, "checkpoint_keep_last", 2),
                 )
 
@@ -811,7 +847,7 @@ def train(cfg: TrainConfig) -> dict:
                 _save_requested = False
                 tqdm.write(f"SIGUSR1 received — saving checkpoint at step {step + 1}")
                 _save_checkpoint(
-                    model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu,
+                    run_info, model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu,
                     is_master=is_master,
                 )
 
@@ -827,7 +863,7 @@ def train(cfg: TrainConfig) -> dict:
             if world_size > 1:
                 raise
             tqdm.write(f"\nInterrupted at step {step + 1} — saving checkpoint before exit...")
-            _save_checkpoint(model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu, is_master=is_master)
+            _save_checkpoint(run_info, model, optimizer, scheduler, step + 1, metrics_log, ckpt_dir, is_tpu=is_tpu, is_master=is_master)
             metrics_path = ckpt_dir / "metrics.json"
             metrics_path.write_text(json.dumps(metrics_log, indent=2))
             return {"interrupted_at_step": step + 1, "param_count": param_count}
@@ -837,7 +873,7 @@ def train(cfg: TrainConfig) -> dict:
     if world_size > 1:
         val_loss = _reduce_mean(val_loss, is_tpu, device)
     if is_tpu or is_master:
-        _save_checkpoint(model, optimizer, scheduler, end_step, metrics_log, ckpt_dir, is_tpu=is_tpu, is_master=is_master,
+        _save_checkpoint(run_info, model, optimizer, scheduler, end_step, metrics_log, ckpt_dir, is_tpu=is_tpu, is_master=is_master,
                          keep_last=getattr(cfg, "checkpoint_keep_last", 2))
 
     # save metrics
@@ -995,114 +1031,108 @@ def evaluate(model, loader: DataLoader, device: torch.device, max_batches: int =
     return total_loss / scored if scored else float("nan")
 
 
-def _write_ckpt(ckpt: dict, path: Path, is_tpu: bool) -> None:
-    """Serialize a checkpoint. On TPU use xm.save (all cores must call it; only master writes)."""
-    if is_tpu and _spmd_mesh is not None:
-        # SPMD is one process, so there is no cross-core rendezvous to join; copy the
-        # (replicated) device tensors to CPU and save like any single-process run.
-        from torch.utils._pytree import tree_map
-        torch.save(tree_map(lambda v: v.cpu() if isinstance(v, torch.Tensor) else v, ckpt), path)
-    elif is_tpu:
-        xm.save(ckpt, str(path))
-    else:
-        torch.save(ckpt, path)
+def _cpu(obj, is_tpu: bool):
+    """CPU copy of every tensor in obj. On TPU this is the device->host transfer xm.save does;
+    under SPMD each tensor comes back whole (gathered from its shards)."""
+    from torch.utils._pytree import tree_map
+    if is_tpu:
+        xm.mark_step()
+    return tree_map(lambda v: v.detach().cpu() if isinstance(v, torch.Tensor) else v, obj)
 
 
-def _strip_prefixes(state_dict: dict) -> dict:
-    """Drop FSDPv2's '_orig_module.', DataParallel's 'module.' and torch.compile's '_orig_mod.'
-    key prefixes. '_orig_module.' goes first: it contains 'module.'."""
-    return {k.replace("_orig_module.", "").replace("module.", "").replace("_orig_mod.", ""): v
-            for k, v in state_dict.items()}
-
-
-def load_model(cfg: TrainConfig, ckpt_path, device: torch.device):
-    """Build a model and load checkpoint weights onto device (for eval/generation)."""
-    model = build_model(cfg).to(device)
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    model.load_state_dict(_strip_prefixes(ckpt["model"]))
+def load_model(ckpt_path, device: torch.device, cfg: TrainConfig | None = None):
+    """Build a model and load checkpoint weights onto device (for eval/generation).
+    `cfg` is needed only for an old .pt checkpoint, which doesn't record its config."""
+    model, _ = checkpoint.load_model(ckpt_path, device, cfg)
     return model
 
 
-def seed_checkpoint(src: Path, dst: Path) -> None:
-    """Write a fresh warm-start checkpoint (weights only, step 0, no optimizer)."""
-    ckpt = torch.load(src, map_location="cpu", weights_only=False)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "step": 0,
-            "model": _strip_prefixes(ckpt["model"]),
-            "optimizer": None,
-            "scheduler": None,
-            "metrics_log": [],
-            "_source": str(src),
-        },
-        dst,
-    )
+def seed_checkpoint(src, dst_dir, name: str = "latest", parent: dict | None = None,
+                    cfg: TrainConfig | None = None) -> checkpoint.Ref:
+    """Write a fresh warm-start checkpoint from `src` (weights only, step 0, no optimizer).
+
+    `src` is anything checkpoint.locate takes. The seed records `cfg` as its config, else the
+    source's; an old .pt has none, so seed one with `cfg` to load it without a YAML.
+    """
+    from dataclasses import asdict
+    ref = checkpoint.locate(src)
+    src_state = checkpoint.read_state(ref)
+    weights = checkpoint.read_weights(ref)
+    alias_map = src_state.get("tied") or {}
+    state = {
+        "step": 0,
+        "tokens_seen": 0,
+        "config": asdict(cfg) if cfg is not None else src_state.get("config"),
+        "tokenizer_sha256": src_state.get("tokenizer_sha256"),
+        "data": None,
+        "parent": parent or {"checkpoint": str(ref.weights), "step": src_state["step"]},
+    }
+    return checkpoint.write(dst_dir, name, weights, alias_map, state, training=None)
 
 
 def _save_checkpoint(
-    model, optimizer, scheduler, step: int, metrics_log: list, ckpt_dir: Path,
+    run_info: dict, model, optimizer, scheduler, step: int, metrics_log: list, ckpt_dir: Path,
     keep_last: int = 2, is_tpu: bool = False, best: bool = False, best_val_loss: float | None = None,
     is_master: bool = True,
 ) -> None:
-    ckpt = {
-        "step": step,
-        "model": _strip_prefixes(model.state_dict()),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict() if scheduler else None,
-        "metrics_log": metrics_log,
-    }
+    """Write `latest` (or `best`, weights only) in the safetensors format, and archive
+    `latest` as step_<N> when keep_last > 0.
 
-    if best:
-        # best.pt is only ever used for serving / warm-start seeding (resume reads
-        # latest.pt), so it never needs optimizer/scheduler state. Writing weights only
-        # keeps these frequent val-improvement writes ~3x smaller — critical on Colab,
-        # where large checkpoints written to the Google Drive FUSE mount buffer in host
-        # RAM faster than they upload and eventually OOM-kill the kernel.
-        best_ckpt = {
-            "step": step,
-            "model": ckpt["model"],
+    Every rank must call this on a multi-process TPU run: the device->host copy is per rank
+    and the ranks meet at a rendezvous after the master has written.
+    """
+    target = model.module if hasattr(model, "module") else model
+    alias_map = checkpoint.aliases(target)
+    weights = _cpu(_strip_prefixes(target.state_dict()), is_tpu)
+    training = None
+    if not best:
+        # best is only ever used for serving / warm-start seeding (resume reads latest), so it
+        # never needs optimizer/scheduler state. Weights only keeps these frequent writes ~3x
+        # smaller -- critical on Colab, where large writes to the Drive FUSE mount buffer in
+        # host RAM faster than they upload and eventually OOM-kill the kernel.
+        training = {
+            "optimizer": _cpu(optimizer.state_dict(), is_tpu) if is_tpu else optimizer.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler else None,
             "metrics_log": metrics_log,
-            "best_val_loss": best_val_loss,
         }
-        _write_ckpt(best_ckpt, ckpt_dir / "best.pt", is_tpu)
-        return
+    state = {
+        "step": step,
+        "tokens_seen": run_info["start_tokens"] + (step - run_info["start_step"]) * run_info["tokens_per_step"],
+        "tokens_estimated": run_info["tokens_estimated"],
+        "config": run_info["config"],
+        "tokenizer_sha256": run_info["tokenizer_sha256"],
+        "data": run_info["data"],
+        "parent": run_info["parent"],
+    }
+    if best:
+        state["best_val_loss"] = best_val_loss
 
-    latest = ckpt_dir / "latest.pt"
-    if keep_last > 0:
-        path = ckpt_dir / f"step_{step}.pt"
-        _write_ckpt(ckpt, path, is_tpu)
-        if is_tpu:
-            # xm.save is a collective — every core must call it; can't substitute a file copy.
-            _write_ckpt(ckpt, latest, is_tpu)
-        else:
-            # Serialize once, then copy the file for latest.pt instead of re-serializing the
-            # whole ~GB checkpoint a second time (halves the save-time work and write burst).
-            shutil.copyfile(path, latest)
-    else:
-        # keep_last=0 archives nothing, so write latest.pt directly. Writing step_N.pt first
-        # and unlinking it below doubled the bytes per save for no benefit — ~2.8GB of extra
-        # traffic to the Drive FUSE mount every checkpoint on the 235M Colab run.
-        # (keep_last is uniform across ranks, so TPU cores still call _write_ckpt in lockstep.)
-        path = latest
-        _write_ckpt(ckpt, latest, is_tpu)
-
-    # Aux files + cleanup: master only (xm.save already wrote only on master).
-    # Use the caller's is_master, which comes from xr.global_ordinal() like every other
-    # rank check in this file. This used to call xm.is_master_ordinal(), a DIFFERENT api
-    # that defaults to the *local* ordinal — when the two disagreed, latest.pt (written
-    # above) still updated but metrics.json did not, so the notebooks' auto-push watcher
-    # polled a step counter frozen at the resume point and never banked anything.
-    if is_tpu and not is_master:
-        return
-    (ckpt_dir / "metrics.json").write_text(json.dumps(metrics_log))
-    tqdm.write(f"Checkpoint saved: {path}")
-
-    # Auto-cleanup: keep only the last N numbered checkpoints. With keep_last=0 nothing
-    # numbered is written any more, so this just sweeps archives left by earlier sessions
-    # (or an interrupt save, which keeps the default). [:-0] is [:0]==empty, so guard it.
-    numbered = sorted(ckpt_dir.glob("step_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
-    for old in (numbered[:-keep_last] if keep_last > 0 else numbered):
-        old.unlink()
-        tqdm.write(f"Removed old checkpoint: {old.name}")
-
+    # Use the caller's is_master, which comes from xr.global_ordinal() like every other rank
+    # check in this file. This used to call xm.is_master_ordinal(), a DIFFERENT api that
+    # defaults to the *local* ordinal -- when the two disagreed, latest.pt still updated but
+    # metrics.json did not, so the notebooks' auto-push watcher polled a step counter frozen
+    # at the resume point and never banked anything.
+    if is_master:
+        name = "best" if best else "latest"
+        ref = checkpoint.write(ckpt_dir, name, weights, alias_map, state, training)
+        # The old single-file checkpoint of the same name is now stale; leaving it would only
+        # confuse anything that still looks for it.
+        (ckpt_dir / f"{name}.pt").unlink(missing_ok=True)
+        if not best:
+            if keep_last > 0:
+                for src in (ref.weights, ref.state, ref.optim):
+                    shutil.copyfile(src, ckpt_dir / src.name.replace("latest", f"step_{step}", 1))
+            (ckpt_dir / "metrics.json").write_text(json.dumps(metrics_log))
+            tqdm.write(f"Checkpoint saved: {ref.weights} (step {step})")
+            # Keep only the last N numbered archives, old .pt ones included. With keep_last=0
+            # nothing numbered is written, so this just sweeps archives of earlier sessions.
+            numbered = sorted({int(p.name.split(".")[0].split("_")[1])
+                               for p in ckpt_dir.glob("step_*.*")})
+            for old in (numbered[:-keep_last] if keep_last > 0 else numbered):
+                for p in ckpt_dir.glob(f"step_{old}.*"):
+                    p.unlink()
+                tqdm.write(f"Removed old checkpoint: step_{old}")
+    if is_tpu and _spmd_mesh is None:
+        import torch_xla.runtime as xr
+        if xr.world_size() > 1:
+            xm.rendezvous("aion_save_checkpoint")

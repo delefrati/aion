@@ -82,6 +82,8 @@ class TrainConfig:
     val_path: str = ""
     val_old_path: str = ""  # optional second text val set (e.g. the previous phase's), logged as val_old_loss
     tokenizer_path: str = ""
+    data_id: str = ""  # where the data came from (e.g. a Kaggle Dataset slug); recorded in each
+    #                    checkpoint's state.json
 
     # instruction tuning
     pretrain_checkpoint: str = ""

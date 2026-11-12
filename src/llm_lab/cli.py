@@ -5,8 +5,12 @@ Usage:
     python -m llm_lab.cli prepare --src-dir <path> --out-dir <path>
     python -m llm_lab.cli tokenizer --corpus <path> --out <path> [--vocab-size 16384]
     python -m llm_lab.cli train --config <path>
-    python -m llm_lab.cli eval --checkpoint <path> --config <path>
-    python -m llm_lab.cli generate --checkpoint <path> --config <path> --prompt "..."
+    python -m llm_lab.cli eval --checkpoint <path> [--config <path>]
+    python -m llm_lab.cli generate --checkpoint <path> [--config <path>] --prompt "..."
+
+A checkpoint path is a checkpoint directory (its latest), one of a checkpoint's files
+(name.safetensors / name.state.json), or an old .pt. --config is needed only for an old .pt:
+the newer checkpoints record their config in state.json.
 """
 from __future__ import annotations
 
@@ -144,34 +148,37 @@ def cmd_train(args):
               f"params={result.get('param_count', 0):,}")
 
 
-def cmd_eval(args):
-    import torch
+def _config_arg(args):
+    """The TrainConfig from --config, or None to use the checkpoint's own."""
     from llm_lab.training.config import TrainConfig
-    from llm_lab.training.trainer import load_model
+    return TrainConfig.load(Path(args.config)) if args.config else None
+
+
+def cmd_eval(args):
+    from llm_lab.training import checkpoint
     from llm_lab.eval.metrics import perplexity
-    from llm_lab.tokenizer.bpe import load_tokenizer
     from llm_lab.utils import pick_device
 
-    cfg = TrainConfig.load(Path(args.config))
     device = pick_device()
+    model, state = checkpoint.load_model(args.checkpoint, device, _config_arg(args))
+    cfg = checkpoint.config_from_state(state, _config_arg(args))
+    tok = checkpoint.tokenizer_path(args.checkpoint, args.tokenizer)
+    val = Path(args.val) if args.val else Path(cfg.val_path)
 
-    model = load_model(cfg, args.checkpoint, device)
-
-    ppl = perplexity(model, Path(cfg.val_path), Path(cfg.tokenizer_path), cfg.seq_len)
+    ppl = perplexity(model, val, tok, cfg.seq_len)
     print(f"Perplexity on val set: {ppl:.2f}")
 
 
 def cmd_bench(args):
     import json
     import torch
-    from llm_lab.training.config import TrainConfig
-    from llm_lab.eval.benchmarks import TASKS, HEADLINE, run_task, load_checkpoint_model, format_table
+    from llm_lab.training import checkpoint
+    from llm_lab.eval.benchmarks import TASKS, HEADLINE, run_task, format_table
     from llm_lab.tokenizer.bpe import load_tokenizer
     from llm_lab.utils import pick_device
 
-    cfg = TrainConfig.load(Path(args.config))
+    cfg = _config_arg(args)
     device = pick_device()
-    tokenizer = load_tokenizer(Path(args.tokenizer or cfg.tokenizer_path))
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     unknown = [t for t in tasks if t not in TASKS]
     if unknown:
@@ -182,11 +189,14 @@ def cmd_bench(args):
     for spec in args.checkpoint:
         label, _, path = spec.rpartition("=")
         label = label or Path(path).stem
-        model, step = load_checkpoint_model(cfg, Path(path), device)
+        model, state = checkpoint.load_model(path, device, cfg)
+        step = int(state.get("step", 0))
+        seq_len = checkpoint.config_from_state(state, cfg).seq_len
+        tokenizer = load_tokenizer(checkpoint.tokenizer_path(path, args.tokenizer))
         entry = {"checkpoint": path, "step": step, "limit": args.limit, "tasks": {}}
         print(f"== {label}: {path} @ step {step:,} on {device}")
         for t in tasks:
-            r = run_task(model, tokenizer, t, cfg.seq_len, device,
+            r = run_task(model, tokenizer, t, seq_len, device,
                          batch_size=args.batch_size, limit=args.limit)
             entry["tasks"][t] = r
             k = HEADLINE[t]
@@ -205,20 +215,14 @@ def cmd_bench(args):
 
 
 def cmd_generate(args):
-    import torch
-    from llm_lab.training.config import TrainConfig
-    from llm_lab.training.trainer import load_model
+    from llm_lab.training import checkpoint
     from llm_lab.eval.metrics import generate
     from llm_lab.tokenizer.bpe import load_tokenizer
     from llm_lab.utils import pick_device
 
-    cfg = TrainConfig.load(Path(args.config))
     device = pick_device()
-
-    model = load_model(cfg, args.checkpoint, device)
-
-    tok_path = Path(args.tokenizer) if args.tokenizer else Path(cfg.tokenizer_path)
-    tokenizer = load_tokenizer(tok_path)
+    model, _ = checkpoint.load_model(args.checkpoint, device, _config_arg(args))
+    tokenizer = load_tokenizer(checkpoint.tokenizer_path(args.checkpoint, args.tokenizer))
 
     # Stop at the chat end marker so we don't ramble into a fake next turn. The trainer's
     # <|end|> isn't the same token as generate()'s built-in <eos>, so pass it explicitly.
@@ -248,7 +252,7 @@ def cmd_finetune(args):
     from dataclasses import asdict
 
     from llm_lab.training.config import TrainConfig
-    from llm_lab.training import trainer
+    from llm_lab.training import checkpoint, trainer
 
     cfg = TrainConfig.load(Path(args.config))
     if getattr(cfg, "dataset_type", "text") == "text":
@@ -257,23 +261,21 @@ def cmd_finetune(args):
         cfg.instruction_data = args.data
 
     ckpt_dir = Path(cfg.checkpoint_dir)
-    latest = ckpt_dir / "latest.pt"
+    has_latest = checkpoint.find(ckpt_dir) is not None
     pretrain = args.pretrain or cfg.pretrain_checkpoint
-    if not latest.exists() and pretrain and Path(pretrain).is_file():
-        trainer.seed_checkpoint(Path(pretrain), latest)
+    if not has_latest and pretrain and Path(pretrain).exists():
+        trainer.seed_checkpoint(pretrain, ckpt_dir)
         print(f"Seeded fine-tune start from {pretrain} (fresh optimizer)")
-    elif not latest.exists():
+    elif not has_latest:
         print(f"No pretrained checkpoint at {pretrain!r}; training from scratch")
 
     result = trainer.train(cfg)
     print(f"Done. best_val_loss={result.get('best_val_loss', float('nan')):.4f}")
 
     # Export serving bundle with embedded config (provider reads config from bundle)
-    best = ckpt_dir / "best.pt"
-    src = best if best.exists() else latest
-    bundle = torch.load(src, map_location="cpu", weights_only=False)
-    export_path = ckpt_dir / "model_serving.pt"
-    torch.save({"model": bundle["model"], "config": asdict(cfg)}, export_path)
+    src = checkpoint.find(ckpt_dir, "best") or checkpoint.find(ckpt_dir)
+    export_path = ckpt_dir / "model_serving.pt"  # the backend's provider reads this bundle
+    torch.save({"model": checkpoint.read_weights(src), "config": asdict(cfg)}, export_path)
     print(f"Serving bundle saved: {export_path}")
 
 
@@ -322,16 +324,19 @@ def main():
     p.add_argument("--config", required=True, help="Path to train config .yaml")
 
     # eval
-    p = sub.add_parser("eval", help="Evaluate a checkpoint")
+    p = sub.add_parser("eval", help="Perplexity of a checkpoint on a val set")
     p.add_argument("--checkpoint", required=True)
-    p.add_argument("--config", required=True)
+    p.add_argument("--config", default=None, help="Training YAML; needed only for an old .pt")
+    p.add_argument("--tokenizer", default=None, help="Override the checkpoint's tokenizer")
+    p.add_argument("--val", default=None, help="Val text file (default: the config's val_path)")
 
     # bench
     p = sub.add_parser("bench", help="Zero-shot HellaSwag/ARC/PIQA accuracy of checkpoints")
-    p.add_argument("--config", required=True, help="Train config matching the checkpoints' architecture")
+    p.add_argument("--config", default=None,
+                   help="Training YAML matching the checkpoints' architecture; needed only for old .pt files")
     p.add_argument("--checkpoint", required=True, action="append",
                    help="[label=]path; repeat to compare several checkpoints")
-    p.add_argument("--tokenizer", default=None, help="Override tokenizer path from config")
+    p.add_argument("--tokenizer", default=None, help="Override the checkpoints' tokenizer")
     p.add_argument("--tasks", default="hellaswag,arc_easy,arc_challenge,piqa")
     p.add_argument("--limit", type=int, default=0, help="First N questions per task (0 = all)")
     p.add_argument("--batch-size", type=int, default=32)
@@ -340,9 +345,9 @@ def main():
     # generate
     p = sub.add_parser("generate", help="Generate text from a checkpoint")
     p.add_argument("--checkpoint", required=True)
-    p.add_argument("--config", required=True)
+    p.add_argument("--config", default=None, help="Training YAML; needed only for an old .pt")
     p.add_argument("--prompt", required=True)
-    p.add_argument("--tokenizer", default=None, help="Override tokenizer path from config")
+    p.add_argument("--tokenizer", default=None, help="Override the checkpoint's tokenizer")
     p.add_argument("--max-tokens", type=int, default=128)
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top-k", type=int, default=40)

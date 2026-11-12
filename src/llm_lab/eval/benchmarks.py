@@ -164,16 +164,14 @@ def run_task(model, tokenizer, name: str, seq_len: int, device: torch.device,
 
 
 def load_checkpoint_model(cfg, ckpt_path: Path, device: torch.device):
-    """Build the model and load weights, mmap'd so the ~2.8GB latest.pt (which also carries
-    optimizer state) isn't read into host RAM in full. Returns (model, step)."""
-    from llm_lab.training.model_factory import build_model
-    from llm_lab.training.trainer import _strip_prefixes
-    model = build_model(cfg)
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False, mmap=True)
-    model.load_state_dict(_strip_prefixes(ckpt["model"]))
-    step = int(ckpt.get("step", 0))
-    del ckpt
-    return model.to(device).eval(), step
+    """Build the model and load its weights. Returns (model, step).
+
+    `cfg` may be None for a checkpoint that records its config (state.json); an old .pt
+    needs one. Old .pt files are mmap'd, so a ~2.8GB latest.pt (which also carries optimizer
+    state) isn't read into host RAM in full."""
+    from llm_lab.training import checkpoint
+    model, state = checkpoint.load_model(ckpt_path, device, cfg)
+    return model, int(state.get("step", 0))
 
 
 def format_table(results: dict[str, dict]) -> str:

@@ -7,7 +7,7 @@ variants to ~1e-2 (bf16 noise), which catches a variant that computes something 
 (say, a mis-sharded flash kernel) as well as measuring its speed.
 
     python -m llm_lab.tools.tpu_sweep --config configs/transformer_tpu_large_edu_spmd.yaml \\
-        --seed-ckpt /tmp/checkpoints/latest.pt --data-dir /tmp/data --work /tmp/sweep
+        --seed-ckpt /tmp/checkpoints --data-dir /tmp/data --work /tmp/sweep
 
 Prints a table and writes the rows to --out (JSON).
 """
@@ -51,7 +51,8 @@ def _run(name: str, overrides: dict, base: dict, seed: Path, work: Path, steps: 
     d = work / re.sub(r"[^\w.-]+", "_", name)
     shutil.rmtree(d, ignore_errors=True)
     d.mkdir(parents=True)
-    shutil.copy2(seed, d / "latest.pt")
+    for f in seed.glob("latest.*"):
+        shutil.copy2(f, d / f.name)
     batch = overrides.get("batch_size", base["batch_size"])
     cfg = {**base, **overrides,
            "lr": 0.0, "warmup_steps": 0, "lr_schedule": "cosine", "lr_decay_steps": 0,
@@ -97,7 +98,7 @@ def _run(name: str, overrides: dict, base: dict, seed: Path, work: Path, steps: 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", required=True, help="base training YAML (the run to tune)")
-    ap.add_argument("--seed-ckpt", required=True, help="checkpoint whose weights every variant starts from")
+    ap.add_argument("--seed-ckpt", required=True, help="checkpoint (dir, file or old .pt) whose weights every variant starts from")
     ap.add_argument("--data-dir", required=True, help="holds train.bin, val.bin, tokenizer.json")
     ap.add_argument("--work", default="/tmp/sweep")
     ap.add_argument("--steps", type=int, default=40, help="steps per variant (log every 10)")
@@ -114,8 +115,9 @@ def main() -> None:
                 tpu_cores=0, tpu_spmd=True)
     work = Path(args.work)
     work.mkdir(parents=True, exist_ok=True)
-    seed = work / "seed.pt"
-    seed_checkpoint(Path(args.seed_ckpt), seed)  # weights only, step 0: no optimizer to restore
+    seed = work / "seed"
+    shutil.rmtree(seed, ignore_errors=True)
+    seed_checkpoint(args.seed_ckpt, seed)  # weights only, step 0: no optimizer to restore
 
     picked = [VARIANTS[int(i)] for i in args.only.split(",")] if args.only else VARIANTS
     rows = []

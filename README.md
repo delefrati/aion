@@ -83,15 +83,29 @@ python -m llm_lab.cli tokenizer --corpus data/prepared/corpus.txt \
 python -m llm_lab.cli train --config llm_lab/configs/mamba_small.yaml
 
 # 5. Evaluate a checkpoint (perplexity on the val set)
-python -m llm_lab.cli eval --checkpoint checkpoints/best.pt \
-    --config llm_lab/configs/mamba_small.yaml
+python -m llm_lab.cli eval --checkpoint checkpoints/best.safetensors
 
 # 6. Generate text from a checkpoint
-python -m llm_lab.cli generate --checkpoint checkpoints/best.pt \
-    --config llm_lab/configs/mamba_small.yaml \
+python -m llm_lab.cli generate --checkpoint checkpoints \
     --prompt "What is machine learning?" \
     --max-tokens 128 --temperature 0.8 --top-k 40
 ```
+
+### Checkpoint files
+
+A checkpoint called `latest` (or `best`, or `step_<N>`) is three files in the checkpoint
+directory:
+
+| File | Holds |
+|------|-------|
+| `latest.safetensors` | Model weights; tied embeddings are stored once |
+| `latest.state.json` | Step, tokens seen, the full training config, tokenizer hash, data id, parent run |
+| `latest.optim.pt` | Optimizer and scheduler state (absent for weights-only checkpoints such as `best`) |
+
+`--checkpoint` takes the directory (meaning its `latest`), any one of these files, or an old
+single-file `.pt` checkpoint. The old `.pt` files don't record their config, so they need
+`--config <training YAML>`; the new ones don't. `tokenizer.json` is read from beside the
+checkpoint unless `--tokenizer` says otherwise.
 
 ### Chat fine-tuning
 
@@ -103,7 +117,7 @@ python -m llm_lab.cli merge-chat --raw-dir data/raw --out data/chat_merged.json
 
 # Instruction-tune a pretrained checkpoint (exports a serving bundle)
 python -m llm_lab.cli finetune --config llm_lab/configs/mamba_chat.yaml \
-    --pretrain checkpoints/best.pt --data data/chat_merged.json
+    --pretrain checkpoints/best.safetensors --data data/chat_merged.json
 ```
 
 ### Commands
@@ -117,6 +131,7 @@ python -m llm_lab.cli finetune --config llm_lab/configs/mamba_chat.yaml \
 | `train` | Train a model from a YAML config (auto-detects CPU / multi-GPU DDP / multi-core TPU) |
 | `finetune` | Instruction-tune a pretrained model and export a serving bundle |
 | `eval` | Report perplexity of a checkpoint on the val set |
+| `bench` | Zero-shot HellaSwag / ARC / PIQA accuracy of one or more checkpoints |
 | `generate` | Generate text from a checkpoint (`--temperature`, `--top-k`, `--top-p`, `--repetition-penalty`, `--stop-token`) |
 | `pull-cache` | Fetch a tokenized cache from a GitHub Release |
 | `push-cache` | Publish a tokenized cache as a GitHub Release |
