@@ -1,0 +1,381 @@
+"""One training session of a run: restore, seed, train, bank, push.
+
+A notebook session used to do this in its own cells, and most of the lost time came from
+there: checkpoints never pushed (43k-44k), a run restarted from scratch in silence, and
+no-op re-pushes of restored files. This is the one implementation, with tests.
+
+    spec = SessionSpec(name="edu2", store=KaggleStore(...), config=yaml_dict,
+                       target_steps=70000, work_dir=Path("/tmp/aion"),
+                       parent=KaggleStore(...), data=KaggleStore(...))
+    result = run_session(spec)
+
+What a session does:
+1. Restore the run's store into work_dir/checkpoints. The run must already exist unless
+   spec.start says this session may start it (seeded from spec.parent, or from scratch).
+   Fails closed: a store without a checkpoint, or a missing store the spec didn't say to
+   start, stops the session before anything trains or pushes.
+2. Restore the tokenized data (spec.data) into work_dir/data.
+3. Train in a subprocess (`python -m llm_lab.cli train`), so every launch path the CLI knows
+   (CPU, CUDA DDP, TPU SPMD) works the same way.
+4. While it trains, bank each newly completed checkpoint (checkpoint.banked: only what a
+   COMPLETE marker names, never a partial save) to the store in the background, so a hard
+   timeout loses at most one checkpoint interval. A failed push is retried later and never
+   recorded as done; the checkpoint is also mirrored to spec.fallback_dir, if set.
+5. Push once more at the end, if this session got further than the store already has.
+   A session that made no progress pushes nothing.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
+
+from llm_lab.storage import Store, StoreError
+from llm_lab.training import checkpoint, metrics
+
+
+class SessionError(RuntimeError):
+    """The session stopped on purpose, before training, so nothing was changed."""
+
+
+class PushError(RuntimeError):
+    """The session trained, but its progress couldn't be pushed to the store."""
+
+
+@dataclass
+class SessionSpec:
+    name: str                          # the run, for messages
+    store: Store                       # where the run's checkpoints live between sessions
+    config: dict                       # the training YAML, as loaded
+    target_steps: int                  # the run's budget: no session trains past it
+    work_dir: Path                     # local: checkpoints/, data/, run.yaml
+    parent: Store | None = None        # the run's first session seeds from its latest checkpoint
+    start: bool = False                # this session may start the run (the store is missing)
+    data: Store | None = None          # tokenized cache: train.bin, val.bin, tokenizer.json
+    steps: int | None = None           # steps this session; None trains to target_steps
+    deadline: float | None = None      # time.time() by which training must stop (timed session)
+    reserve_minutes: float = 20        # of a timed session, kept for the final eval/save/push
+    lr_decay_to_target: bool = False   # schedule spans the budget (WSD runs that may extend)
+    push: bool = True                  # False: a smoke test; nothing leaves the machine
+    bank_every: float = 120            # seconds between background bank checks
+    fallback_dir: Path | None = None   # mirror of the checkpoint when a push fails
+    overrides: dict = field(default_factory=dict)  # last-word config changes for this session
+    python: str = sys.executable
+
+    @property
+    def ckpt_dir(self) -> Path:
+        return Path(self.work_dir) / "checkpoints"
+
+    @property
+    def data_dir(self) -> Path:
+        return Path(self.work_dir) / "data"
+
+
+@dataclass
+class SessionResult:
+    start_step: int
+    end_step: int            # the latest checkpoint on disk when the session ended
+    pushed_step: int | None  # the latest step the store holds (None: never pushed this run)
+    returncode: int          # the trainer's; 0 when there was nothing to train
+    phase_done: bool         # end_step reached target_steps
+
+
+# --- restore --------------------------------------------------------------------------------
+
+def _latest_step(ckpt_dir: Path) -> int | None:
+    ref = checkpoint.find(ckpt_dir)
+    return None if ref is None else checkpoint.read_state(ref)["step"]
+
+
+def restore(spec: SessionSpec) -> int:
+    """Put the run's latest checkpoint in spec.ckpt_dir; return its step.
+
+    The store's files replace whatever the directory held. A missing store is a new run
+    only when spec.start says so; then the parent's latest weights become step 0 (or, with
+    no parent, training starts from random init)."""
+    d = spec.ckpt_dir
+    if d.exists():
+        shutil.rmtree(d)
+    d.mkdir(parents=True)
+    files = spec.store.files()
+    if files is not None:
+        if spec.start:
+            raise SessionError(f"{spec.store} already exists, but this session was told to start "
+                               f"{spec.name}. Resume it instead (start=False); starting over "
+                               f"would push step 0 over its progress.")
+        spec.store.download(d)
+        step = _latest_step(d)
+        if step is None:
+            raise SessionError(f"{spec.store} exists but holds no checkpoint "
+                               f"(files: {sorted(files)}). Refusing to train from scratch over it.")
+        print(f"{spec.name}: resuming from step {step:,} ({spec.store}).")
+        return step
+    if not spec.start:
+        raise SessionError(f"{spec.store} not found. If this is {spec.name}'s first session, "
+                           f"start it explicitly (start=True); a lookup that wrongly reports "
+                           f"'missing' must never seed a run over its real progress.")
+    if spec.parent is None:
+        print(f"{spec.name}: new run, training from random init.")
+        return 0
+    _seed_from_parent(spec)
+    return 0
+
+
+def _seed_from_parent(spec: SessionSpec) -> None:
+    """The parent's latest weights as this run's step 0 (fresh optimizer, no history)."""
+    from llm_lab.training.config import TrainConfig
+    from llm_lab.training.trainer import seed_checkpoint
+    src = Path(spec.work_dir) / "parent"
+    shutil.rmtree(src, ignore_errors=True)
+    files = spec.parent.files()
+    if files is None:
+        raise SessionError(f"Parent {spec.parent} not found: nothing to seed {spec.name} from.")
+    if checkpoint.MARKERS["latest"] in files:
+        spec.parent.download(src, only=[checkpoint.MARKERS["latest"]])
+        name = checkpoint.read_marker(src)["checkpoint"]
+        need = [name + checkpoint.WEIGHTS, name + checkpoint.STATE]
+    else:  # an old run: latest.pt
+        need = ["latest.pt"]
+    spec.parent.download(src, only=need + ["tokenizer.json"], required=need)
+    ref = checkpoint.find(src)
+    parent_step = checkpoint.read_state(ref)["step"]
+    cfg = TrainConfig.from_dict({**spec.config, **spec.overrides})
+    seed_checkpoint(ref.weights, spec.ckpt_dir, cfg=cfg,
+                    parent={"store": str(spec.parent), "checkpoint": ref.weights.name, "step": parent_step})
+    if (src / "tokenizer.json").exists():
+        shutil.copy2(src / "tokenizer.json", spec.ckpt_dir / "tokenizer.json")
+    shutil.rmtree(src)  # gigabytes back before the data cache lands
+    print(f"{spec.name}: seeded from {spec.parent} {ref.weights.name} @ step {parent_step:,} "
+          f"(step 0, fresh optimizer). The first push creates {spec.store}.")
+
+
+DATA_FILES = ("train.bin", "val.bin", "tokenizer.json")
+
+
+def fetch_data(spec: SessionSpec) -> None:
+    if spec.data is None:
+        return
+    print(f"Free disk in {spec.work_dir}: {shutil.disk_usage(spec.work_dir).free / 1e9:.0f} GB")
+    if spec.data.download(spec.data_dir, only=DATA_FILES + ("val_old.bin",),
+                          required=DATA_FILES) is None:
+        raise SessionError(f"Data {spec.data} not found.")
+
+
+# --- config ---------------------------------------------------------------------------------
+
+def session_config(spec: SessionSpec, start_step: int) -> dict | None:
+    """The config this session trains with, or None when the budget is already spent."""
+    if start_step >= spec.target_steps:
+        return None
+    cfg = dict(spec.config)
+    cfg["checkpoint_dir"] = str(spec.ckpt_dir)
+    if spec.data is not None:
+        dd = spec.data_dir
+        cfg.update(dataset_type="text", train_path=str(dd / "train.txt"), val_path=str(dd / "val.txt"),
+                   tokenizer_path=str(dd / "tokenizer.json"), instruction_data="",
+                   val_old_path=str(dd / "val_old.txt") if (dd / "val_old.bin").exists() else "",
+                   data_id=str(spec.data))
+    end = spec.target_steps if spec.steps is None else min(start_step + spec.steps, spec.target_steps)
+    cfg["max_steps"] = end
+    if spec.lr_decay_to_target:
+        cfg["lr_decay_steps"] = spec.target_steps
+    if spec.deadline is not None:
+        minutes = (spec.deadline - time.time()) / 60 - spec.reserve_minutes
+        cfg["max_train_minutes"] = max(10.0, minutes)
+    cfg.update(spec.overrides)
+    return cfg
+
+
+# --- banking --------------------------------------------------------------------------------
+
+EXTRAS = ("tokenizer.json", "run.yaml")
+
+
+def snapshot(ckpt_dir: Path, dest: Path, attempts: int = 5) -> int | None:
+    """Hard-link the banked checkpoint files (plus tokenizer, run.yaml, a copy of
+    metrics.jsonl) into dest. Returns the banked step, or None if nothing is banked yet.
+
+    Links, not copies: the files are immutable once a marker names them, and a later save
+    can prune them while an upload still reads them; a link keeps them alive. If one is
+    pruned before it's linked, banked() is asked again.
+    """
+    for _ in range(attempts):
+        b = checkpoint.banked(ckpt_dir)
+        if b is None:
+            return None
+        step, files = b
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.mkdir(parents=True)
+        try:
+            for f in files + [ckpt_dir / n for n in EXTRAS if (ckpt_dir / n).exists()]:
+                try:
+                    os.link(f, dest / f.name)
+                except OSError:
+                    if not f.exists():
+                        raise
+                    shutil.copy2(f, dest / f.name)
+        except FileNotFoundError:
+            continue  # pruned under us: a newer checkpoint is banked now
+        m = ckpt_dir / metrics.FILE
+        if m.exists():
+            shutil.copyfile(m, dest / m.name)  # still being appended to: copy what's there
+        return step
+    raise RuntimeError(f"{ckpt_dir}: the banked checkpoint kept changing while being linked")
+
+
+class Banker:
+    """Pushes the newest banked checkpoint when it's newer than the store's. Never records a
+    push as done unless the store accepted it."""
+
+    def __init__(self, spec: SessionSpec, pushed_step: int | None):
+        self.spec = spec
+        self.pushed = pushed_step
+        self.lock = threading.Lock()
+        self.stage = Path(spec.work_dir) / "push"
+        self.fail_streak = 0
+        self.retry_after = 0.0
+
+    def bank(self, why: str) -> bool:
+        """Push if there is something newer. True when the store is up to date afterwards."""
+        with self.lock:
+            step = snapshot(self.spec.ckpt_dir, self.stage)
+            if step is None or (self.pushed is not None and step <= self.pushed):
+                return True
+            print(f"[bank] {why}: pushing step {step:,} to {self.spec.store}...", flush=True)
+            try:
+                self.spec.store.push(sorted(self.stage.iterdir()), f"step {step}")
+            except StoreError as e:
+                self.fail_streak += 1
+                self.retry_after = time.time() + min(600 * self.fail_streak, 1800)
+                print(f"[bank] step {step:,} NOT banked: {e}", flush=True)
+                self._mirror(step)
+                return False
+            finally:
+                shutil.rmtree(self.stage, ignore_errors=True)
+            self.pushed, self.fail_streak, self.retry_after = step, 0, 0.0
+            print(f"[bank] step {step:,} banked.", flush=True)
+            return True
+
+    def _mirror(self, step: int) -> None:
+        """Last-ditch copy where the platform keeps output (Kaggle: /kaggle/working)."""
+        dest = self.spec.fallback_dir
+        if dest is None:
+            return
+        try:
+            tmp = Path(self.spec.work_dir) / "mirror"
+            if snapshot(self.spec.ckpt_dir, tmp) is None:
+                return
+            need = sum(p.stat().st_size for p in tmp.iterdir())
+            Path(dest).mkdir(parents=True, exist_ok=True)
+            free = shutil.disk_usage(dest).free
+            if free < need * 1.5:
+                print(f"[bank] no room to mirror to {dest} ({need / 1e9:.1f}GB needed, "
+                      f"{free / 1e9:.1f}GB free).")
+                return
+            for old in Path(dest).iterdir():
+                if old.is_file():
+                    old.unlink()
+            for p in tmp.iterdir():
+                shutil.copy2(p, Path(dest) / p.name)
+            shutil.rmtree(tmp)
+            print(f"[bank] mirrored step {step:,} to {dest}.")
+        except Exception as e:  # the mirror must never take the session down
+            print(f"[bank] mirror to {dest} failed: {e}")
+
+    def watch(self, stop: threading.Event) -> None:
+        while not stop.wait(self.spec.bank_every):
+            if time.time() < self.retry_after:
+                continue
+            try:
+                self.bank("background")
+            except Exception as e:  # keep watching; the final push still runs
+                print(f"[bank] skipped this cycle: {e}", flush=True)
+
+
+# --- the session ----------------------------------------------------------------------------
+
+def train(spec: SessionSpec, cfg: dict, on_line=None) -> int:
+    """Run `llm_lab.cli train` on cfg in a subprocess; stream its output; return its exit code."""
+    run_yaml = spec.ckpt_dir / "run.yaml"
+    run_yaml.write_text(yaml.dump(cfg))
+    src_root = Path(__file__).resolve().parent.parent
+    env = {**os.environ, "PYTHONPATH": str(src_root) + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    proc = subprocess.Popen([spec.python, "-u", "-m", "llm_lab.cli", "train", "--config", str(run_yaml)],
+                            cwd=src_root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    try:
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+            if on_line:
+                on_line(line, proc)
+        return proc.wait()
+    except BaseException:
+        # Interrupted (a notebook "stop"): SIGINT lets the trainer save its last completed
+        # step, which the final push in run_session then banks.
+        import signal
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=600)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        raise
+
+
+def run_session(spec: SessionSpec, on_line=None) -> SessionResult:
+    """Restore, train, bank and push one session. See the module docstring."""
+    Path(spec.work_dir).mkdir(parents=True, exist_ok=True)
+    start = restore(spec)
+    # A seeded run's step 0 isn't in the store yet; a resumed run's start step is.
+    pushed = None if spec.start else start
+    cfg = session_config(spec, start)
+    if cfg is None:
+        print(f"{spec.name}: budget reached ({start:,}/{spec.target_steps:,} steps): nothing to train.")
+        return SessionResult(start, start, pushed, 0, True)
+    fetch_data(spec)
+    print(f"{spec.name}: training steps {start:,} -> {cfg['max_steps']:,} of {spec.target_steps:,}"
+          + (f", for at most {cfg['max_train_minutes']:.0f} min" if spec.deadline else "")
+          + ("" if spec.push else " (smoke test: nothing will be pushed)"), flush=True)
+
+    banker = Banker(spec, pushed)
+    stop = threading.Event()
+    watcher = threading.Thread(target=banker.watch, args=(stop,), daemon=True)
+    if spec.push:
+        watcher.start()
+    rc = 1
+    try:
+        rc = train(spec, cfg, on_line)
+    finally:
+        stop.set()
+        if watcher.is_alive():
+            watcher.join(timeout=60)
+        end = _latest_step(spec.ckpt_dir)
+        end = start if end is None else end
+        if not spec.push:
+            print(f"Smoke test done at step {end:,}: nothing pushed.")
+        elif end > start:
+            if not banker.bank("final") and not banker.bank("final, retry"):
+                print(f"[bank] FINAL PUSH FAILED: {spec.store} still holds step "
+                      f"{banker.pushed if banker.pushed is not None else 'none'}, so the next "
+                      f"session resumes behind step {end:,}"
+                      + (f". A copy is in {spec.fallback_dir}." if spec.fallback_dir else "."))
+        else:
+            print(f"No progress this session (still step {end:,}): nothing pushed; "
+                  f"{spec.store} keeps what it had.")
+    result = SessionResult(start, end, banker.pushed, rc, end >= spec.target_steps)
+    if spec.push and end > start and (banker.pushed is None or banker.pushed < end):
+        raise PushError(f"Step {end:,} was trained but not pushed; {spec.store} holds "
+                        f"{banker.pushed}." + (f" Copy in {spec.fallback_dir}." if spec.fallback_dir else ""))
+    if rc != 0:
+        raise RuntimeError(f"Training exited with code {rc} at step {end:,} "
+                           f"(store holds {result.pushed_step}).")
+    return result

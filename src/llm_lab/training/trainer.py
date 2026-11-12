@@ -710,6 +710,7 @@ def train(cfg: TrainConfig) -> dict:
         max_minutes = 0
     end_step = cfg.max_steps
     last_saved = start_step  # the final save is skipped when the last step was just saved
+    done = start_step        # steps whose optimizer update has run
     t_log, step_log = time.time(), start_step
 
     for step in tqdm(range(start_step, cfg.max_steps), initial=start_step, total=cfg.max_steps,
@@ -782,6 +783,7 @@ def train(cfg: TrainConfig) -> dict:
                 scaler.step(optimizer)
                 scaler.update()
             scheduler.step()
+            done = step + 1
             if use_fsdp and step == start_step:
                 _shard_optimizer_state(optimizer, is_master)  # fresh moments exist only now
 
@@ -843,7 +845,7 @@ def train(cfg: TrainConfig) -> dict:
                             is_master=is_master,
                         )
                     if is_master:
-                        tqdm.write(f"New best val_loss {best_val_loss:.4f} at step {best_step} (saved: best.pt)")
+                        tqdm.write(f"New best val_loss {best_val_loss:.4f} at step {best_step} (BEST -> step_{best_step})")
                 # early stop: measure improvement within this session.
                 if val_loss < early_stop_best - min_delta:
                     early_stop_best = val_loss
@@ -897,9 +899,14 @@ def train(cfg: TrainConfig) -> dict:
             # Multi-core: skip the save (an unsynchronized xm.save would deadlock the other cores)
             if world_size > 1:
                 raise
-            tqdm.write(f"\nInterrupted at step {step + 1} — saving checkpoint before exit...")
-            _save_checkpoint(run_info, model, optimizer, scheduler, step + 1, ckpt_dir, is_tpu=is_tpu, is_master=is_master)
-            return {"interrupted_at_step": step + 1, "param_count": param_count}
+            # Save the last COMPLETED step: an interrupt mid-step leaves that step's update
+            # unapplied, and labelling the weights step + 1 would skip it on resume.
+            tqdm.write(f"\nInterrupted after step {done} — saving checkpoint before exit...")
+            if done != last_saved:
+                _save_checkpoint(run_info, model, optimizer, scheduler, done, ckpt_dir,
+                                 is_tpu=is_tpu, is_master=is_master,
+                                 keep_last=getattr(cfg, "checkpoint_keep_last", 2))
+            return {"interrupted_at_step": done, "steps": done, "param_count": param_count}
 
     # final checkpoint + eval
     val_loss = evaluate(model, val_loader, device, cfg.max_eval_batches)
