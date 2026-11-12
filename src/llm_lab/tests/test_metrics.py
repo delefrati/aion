@@ -42,7 +42,7 @@ def test_training_writes_jsonl_not_into_the_checkpoint(tiny_cfg):
     log = metrics.read(d / metrics.FILE)
     assert _train_steps(log) == [1, 2, 3, 4, 5, 6]
     assert [e["step"] for e in log if "val_loss" in e] == [3, 6]
-    assert set(torch.load(d / "step_6.optim.pt", weights_only=False)) == {"optimizer", "scheduler"}
+    assert "metrics_log" not in torch.load(d / "step_6.optim.pt", weights_only=False)
 
 
 def test_rolled_back_checkpoint_resumes_without_abandoned_steps(tiny_cfg):

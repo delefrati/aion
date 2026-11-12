@@ -235,11 +235,12 @@ def _make_old_val_loader(val_old_path, tokenizer, seq_len, batch_size, max_eval_
 def _make_loaders(train_path, val_path, tokenizer, seq_len, batch_size, num_workers: int = 2,
                   dataset_type: str = "text", instruction_data: str = "",
                   world_size: int = 1, ordinal: int = 0, is_tpu: bool = False, device=None,
-                  max_eval_batches: int = 0):
+                  max_eval_batches: int = 0, seed: int = 0, start_batch: int = 0):
     """Build train and val dataloaders for a given seq_len.
 
-    When world_size > 1, each replica gets a DistributedSampler shard and the
-    loaders are wrapped in an MpDeviceLoader for async host->TPU transfer.
+    Training batches come from a StepBatchSampler starting at `start_batch` (this rank's
+    batch count so far), so the data order doesn't depend on where sessions start. On a
+    multi-process TPU run the loaders are wrapped in an MpDeviceLoader for async transfer.
     """
     distributed = world_size > 1
     pin = num_workers > 0 and not is_tpu  # pinned memory only helps CUDA host->device copies
@@ -272,36 +273,14 @@ def _make_loaders(train_path, val_path, tokenizer, seq_len, batch_size, num_work
         collate_fn = None
         val_drop_last = True
 
+    from llm_lab.data.sampling import StepBatchSampler
+    # Text: billions of windows, drawn with replacement (a permutation of them would be a
+    # tens-of-GB tensor). Finetuning sets: a fresh permutation each epoch.
     is_text = dataset_type not in ("instruction", "chat")
-    if distributed and is_text and not is_tpu:
-        # GPU DDP on a small host: DistributedSampler builds randperm(len)=17.6GB PER RANK for a
-        # 2.2B-token corpus -> OOM. Per-rank-seeded bounded replacement sampling instead (each
-        # rank draws different random samples; overlap is negligible on a huge corpus).
-        from torch.utils.data import RandomSampler
-        _g = torch.Generator()
-        _g.manual_seed(1234 + ordinal)
-        n_samples = min(len(train_ds), 2_000_000)
-        train_sampler = RandomSampler(train_ds, replacement=True, num_samples=n_samples, generator=_g)
-    elif distributed:
-        from torch.utils.data.distributed import DistributedSampler
-        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=ordinal,
-                                           shuffle=True, drop_last=True)
-    elif is_text:
-        # A plain shuffle=True builds torch.randperm(len(dataset)); for the token corpus
-        # len can be billions -> a tens-of-GB tensor that OOMs small GPU hosts (fine on the
-        # roomy TPU VM, which is why TPU worked). Sample WITH REPLACEMENT and a bounded
-        # count so memory is O(num_samples), not O(dataset). Small instruction/chat sets
-        # keep plain shuffling below.
-        from torch.utils.data import RandomSampler
-        n_samples = min(len(train_ds), 2_000_000)
-        train_sampler = RandomSampler(train_ds, replacement=True, num_samples=n_samples)
-    else:
-        train_sampler = None
-
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=(train_sampler is None), sampler=train_sampler,
-        drop_last=True, num_workers=num_workers, pin_memory=pin, collate_fn=collate_fn,
-    )
+    train_sampler = StepBatchSampler(len(train_ds), batch_size, seed, start=start_batch,
+                                     world=world_size, rank=ordinal, replacement=is_text)
+    train_loader = DataLoader(train_ds, batch_sampler=train_sampler, num_workers=num_workers,
+                              pin_memory=pin, collate_fn=collate_fn)
     # Distributed runs shard val across replicas (the text val set is sized for all of them)
     # and average the per-replica losses afterwards.
     val_loader = _val_loader(val_ds, batch_size, num_workers, distributed, world_size, ordinal,
@@ -412,12 +391,13 @@ def _make_scheduler(cfg: TrainConfig, optimizer):
 
 
 def _resume_if_available(cfg: TrainConfig, model, optimizer, scheduler, ckpt_dir: Path,
-                         device: torch.device, is_master: bool) -> tuple[int, dict, list[dict]]:
+                         device: torch.device, is_master: bool) -> tuple[int, dict, list[dict], dict]:
     """Resume from the latest checkpoint if there is one (new format, else an old latest.pt).
-    Returns (start_step, its state, the metrics an old .pt carried inside it)."""
+    Returns (start_step, its state, the metrics an old .pt carried inside it, and the
+    RNG/GradScaler states it saved, for the caller to restore once the loop is set up)."""
     ref = checkpoint.find(ckpt_dir)
     if ref is None:
-        return 0, {}, []
+        return 0, {}, [], {}
 
     # Load on CPU: storages saved from an XLA device are tagged "xla:0" and can't be
     # restored directly onto an XLA device. load_state_dict then copies onto `device`.
@@ -448,6 +428,9 @@ def _resume_if_available(cfg: TrainConfig, model, optimizer, scheduler, ckpt_dir
         scheduler.load_state_dict(training["scheduler"])
     step = state["step"]
     legacy_log = training.get("metrics_log") or []
+    extras = {k: training.get(k) for k in ("rng", "cuda_rng", "scaler")}
+    if reset_opt:
+        extras["scaler"] = None
     fresh = training["optimizer"] is None or reset_opt
     # Free the checkpoint from host RAM before the first step (the CPU copy is no longer
     # needed once weights + optimizer state are on the device).
@@ -459,7 +442,7 @@ def _resume_if_available(cfg: TrainConfig, model, optimizer, scheduler, ckpt_dir
     if is_master:
         tqdm.write(f"Resumed from step {step} ({ref.weights.name})"
                    + (" (fresh optimizer — clean fine-tune start)" if fresh else ""))
-    return step, state, legacy_log
+    return step, state, legacy_log, extras
 
 
 def _load_history(ckpt_dir: Path, start_step: int, legacy_log: list[dict], is_master: bool) -> list[dict]:
@@ -574,15 +557,7 @@ def train(cfg: TrainConfig) -> dict:
     val_path = Path(cfg.val_path) if cfg.val_path else None
     dataset_type = getattr(cfg, "dataset_type", "text")
     instruction_data = getattr(cfg, "instruction_data", "")
-    current_seq_len = initial_seq_len
-    train_loader, val_loader = _make_loaders(
-        train_path, val_path, tokenizer, current_seq_len, cfg.batch_size,
-        getattr(cfg, "num_workers", 2),
-        dataset_type=dataset_type,
-        instruction_data=instruction_data,
-        world_size=world_size, ordinal=ordinal, is_tpu=is_tpu, device=device,
-        max_eval_batches=cfg.max_eval_batches,
-    )
+    current_seq_len = initial_seq_len  # the loaders are built once the resume step is known
     val_old_path = getattr(cfg, "val_old_path", "")
     if val_old_path and dataset_type != "text":
         raise ValueError("val_old_path is for text runs only.")
@@ -619,7 +594,7 @@ def train(cfg: TrainConfig) -> dict:
     best_val_loss = float("inf")
     best_step = 0
     evals_since_improve = 0  # for early stopping
-    start_step, resumed_state, legacy_log = _resume_if_available(
+    start_step, resumed_state, legacy_log, resumed_extras = _resume_if_available(
         cfg, model, optimizer, scheduler, ckpt_dir, device, is_master
     )
     if is_master:
@@ -693,23 +668,42 @@ def train(cfg: TrainConfig) -> dict:
             tqdm.write(f"Already at step {start_step} (max_steps {cfg.max_steps}): nothing to train.")
         return {"steps": start_step, "param_count": param_count, "nothing_to_train": True}
 
-    # training loop
-    model.train()
-    data_iter = iter(train_loader)
-    t0 = time.time()
-
     # Mixed precision: fp16 autocast + grad scaler on CUDA, bf16 autocast on TPU
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # Gradient accumulation
     accum_steps = max(1, cfg.grad_accum_steps)
+
+    # training loop. Batches resume where this run's stream stopped: start_step steps of
+    # accum_steps batches each.
+    train_loader, val_loader = _make_loaders(
+        train_path, val_path, tokenizer, current_seq_len, cfg.batch_size,
+        getattr(cfg, "num_workers", 2),
+        dataset_type=dataset_type,
+        instruction_data=instruction_data,
+        world_size=world_size, ordinal=ordinal, is_tpu=is_tpu, device=device,
+        max_eval_batches=cfg.max_eval_batches,
+        seed=cfg.seed, start_batch=start_step * accum_steps,
+    )
+    model.train()
+    data_iter = iter(train_loader)
+    # The RNG state as the checkpoint left it (dropout), restored after iter(), which draws
+    # from it: an uninterrupted run made that draw before step 0, not here.
+    if resumed_extras.get("rng") is not None:
+        torch.set_rng_state(resumed_extras["rng"])
+    if resumed_extras.get("cuda_rng") is not None and device.type == "cuda":
+        torch.cuda.set_rng_state_all(resumed_extras["cuda_rng"])
+    if resumed_extras.get("scaler") is not None and use_amp:
+        scaler.load_state_dict(resumed_extras["scaler"])
+    t0 = time.time()
     effective_batch = cfg.batch_size * accum_steps * world_size
     if accum_steps > 1 and is_master:
         tqdm.write(f"Gradient accumulation: {accum_steps} steps (effective batch={effective_batch})")
     fuse_step = is_tpu and getattr(cfg, "tpu_fuse_step", False)
     tokens_per_step = effective_batch * cfg.seq_len
     run_info = _run_info(cfg, ckpt_dir, resumed_state, start_step, tokens_per_step)
+    run_info["scaler"] = scaler if use_amp else None  # saved with the optimizer
 
     # Wall-clock session cap. Each rank would read its own clock, so multi-process runs (xmp,
     # DDP) could disagree on the stopping step and deadlock; only one-process runs get it.
@@ -738,6 +732,7 @@ def train(cfg: TrainConfig) -> dict:
                         instruction_data=instruction_data,
                         world_size=world_size, ordinal=ordinal, is_tpu=is_tpu, device=device,
                         max_eval_batches=cfg.max_eval_batches,
+                        seed=cfg.seed, start_batch=step * accum_steps,
                     )
                     data_iter = iter(train_loader)
                     if is_master:
@@ -1138,6 +1133,11 @@ def _save_checkpoint(
         training = {
             "optimizer": _cpu(optimizer.state_dict(), is_tpu) if is_tpu else optimizer.state_dict(),
             "scheduler": scheduler.state_dict() if scheduler else None,
+            # For a resume that continues exactly: the CPU (and CUDA) RNG for dropout, and the
+            # fp16 loss scale, which otherwise restarts at 65536 and skips steps re-finding it.
+            "rng": torch.get_rng_state(),
+            "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() and not is_tpu else None,
+            "scaler": run_info["scaler"].state_dict() if run_info.get("scaler") is not None else None,
         }
     state = {
         "step": step,

@@ -193,7 +193,9 @@ def session_config(spec: SessionSpec, start_step: int) -> dict | None:
                    data_id=str(spec.data))
     end = spec.target_steps if spec.steps is None else min(start_step + spec.steps, spec.target_steps)
     cfg["max_steps"] = end
-    if spec.lr_decay_to_target:
+    if spec.lr_decay_to_target or not cfg.get("lr_decay_steps"):
+        # A session's max_steps isn't where the run ends. With lr_decay_steps unset the
+        # schedule would decay to it, and a short session would take the LR to zero.
         cfg["lr_decay_steps"] = spec.target_steps
     if spec.deadline is not None:
         minutes = (spec.deadline - time.time()) / 60 - spec.reserve_minutes
