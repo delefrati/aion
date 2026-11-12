@@ -45,3 +45,40 @@ def tiny_cfg(corpus, tmp_path):
         train_path=str(corpus["train"]), val_path=str(corpus["val"]),
         tokenizer_path=str(corpus["tokenizer"]), checkpoint_dir=str(tmp_path / "ckpt"),
     )
+
+
+class FakeKaggle:
+    """The fake kaggle CLI (tests/fake_kaggle.py) on PATH, with its Datasets in a temp dir."""
+
+    def __init__(self, root: Path):
+        self.root = root
+
+    def script(self, **queues) -> None:
+        """Queue failures: script(files=["500"], push=["401"], **{"download:x.bin": ["500"]})."""
+        import json
+        (self.root / "script.json").write_text(json.dumps(queues))
+
+    def dataset(self, slug: str) -> Path:
+        return self.root / "datasets" / slug.replace("/", "__")
+
+    def calls(self) -> list[dict]:
+        import json
+        f = self.root / "calls.jsonl"
+        return [json.loads(l) for l in f.read_text().splitlines()] if f.exists() else []
+
+
+@pytest.fixture
+def fake_kaggle(tmp_path, monkeypatch) -> FakeKaggle:
+    import sys
+    root = tmp_path / "fake_kaggle"
+    (root / "datasets").mkdir(parents=True)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    exe = bin_dir / "kaggle"
+    exe.write_text(f"#!{sys.executable}\nimport runpy, sys\n"
+                   f"sys.argv[0] = {str(Path(__file__).with_name('fake_kaggle.py'))!r}\n"
+                   f"runpy.run_path(sys.argv[0], run_name='__main__')\n")
+    exe.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_KAGGLE_ROOT", str(root))
+    return FakeKaggle(root)
