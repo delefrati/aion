@@ -15,4 +15,3 @@ checkpoints/
 *.safetensors
 .venv/
 *.egg-info/
-pyproject.toml

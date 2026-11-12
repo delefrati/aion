@@ -1,0 +1,28 @@
+# Lab and backend tests on CPU, on every push and pull request.
+name: tests
+
+on: [push, pull_request]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            src/pyproject.toml
+            src/backend/pyproject.toml
+      - name: Install CPU-only torch
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install the lab and the backend
+        run: pip install "./src[dev]" "./src/backend[dev]"
+      - name: Lab tests
+        working-directory: src
+        run: python -m pytest llm_lab/tests -q
+      - name: Backend tests
+        working-directory: src/backend
+        run: python -m pytest tests -q

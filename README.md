@@ -138,6 +138,19 @@ python -m llm_lab.cli finetune --config llm_lab/configs/mamba_chat.yaml \
 
 Run `python -m llm_lab.cli <command> --help` for the full argument list of any command.
 
+## Tests
+
+The lab and the backend each have a pytest suite that runs on a CPU in seconds, with a tiny
+model and the deterministic provider; nothing downloads or needs a GPU. CI
+(`.github/workflows/tests.yml`) runs both on every push.
+
+```bash
+cd src
+pip install "./[dev]" "./backend[dev]"   # plus torch; CPU-only is enough
+python -m pytest llm_lab/tests            # from src/
+cd backend && python -m pytest tests      # from src/backend/
+```
+
 ## Training in the Cloud (Colab & Kaggle)
 
 The `llm_lab/` directory ships ready-to-run notebooks for training on free accelerators.
