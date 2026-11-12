@@ -622,6 +622,10 @@ def train(cfg: TrainConfig) -> dict:
     start_step, resumed_state, legacy_log = _resume_if_available(
         cfg, model, optimizer, scheduler, ckpt_dir, device, is_master
     )
+    if is_master:
+        # A rollback leaves later checkpoints (and maybe a BEST among them) from a branch
+        # these weights never reached; a killed save leaves temp files. Clear both first.
+        checkpoint.prune(ckpt_dir, getattr(cfg, "checkpoint_keep_last", 2))
     metrics_log = _load_history(ckpt_dir, start_step, legacy_log, is_master)
     metrics_path = ckpt_dir / metrics.FILE
 
@@ -672,6 +676,13 @@ def train(cfg: TrainConfig) -> dict:
                 f"Lower it to <= {max(_evals_this_session - 1, 1)} to arm it."
             )
 
+    if start_step >= cfg.max_steps:
+        # Nothing to train. Saving here would re-label the restored weights with the lower
+        # max_steps and discard recorded progress.
+        if is_master:
+            tqdm.write(f"Already at step {start_step} (max_steps {cfg.max_steps}): nothing to train.")
+        return {"steps": start_step, "param_count": param_count, "nothing_to_train": True}
+
     # training loop
     model.train()
     data_iter = iter(train_loader)
@@ -698,6 +709,7 @@ def train(cfg: TrainConfig) -> dict:
             tqdm.write("max_train_minutes ignored: multi-process run.")
         max_minutes = 0
     end_step = cfg.max_steps
+    last_saved = start_step  # the final save is skipped when the last step was just saved
     t_log, step_log = time.time(), start_step
 
     for step in tqdm(range(start_step, cfg.max_steps), initial=start_step, total=cfg.max_steps,
@@ -862,6 +874,7 @@ def train(cfg: TrainConfig) -> dict:
                     run_info, model, optimizer, scheduler, step + 1, ckpt_dir, is_tpu=is_tpu, is_master=is_master,
                     keep_last=getattr(cfg, "checkpoint_keep_last", 2),
                 )
+                last_saved = step + 1
 
             # on-demand checkpoint via SIGUSR1 (single-process only — unsynced save deadlocks XLA)
             if _save_requested and world_size == 1:
@@ -871,6 +884,7 @@ def train(cfg: TrainConfig) -> dict:
                     run_info, model, optimizer, scheduler, step + 1, ckpt_dir, is_tpu=is_tpu,
                     is_master=is_master,
                 )
+                last_saved = step + 1
 
             if max_minutes > 0 and (time.time() - t0) / 60 >= max_minutes and step + 1 < cfg.max_steps:
                 end_step = step + 1
@@ -891,7 +905,7 @@ def train(cfg: TrainConfig) -> dict:
     val_loss = evaluate(model, val_loader, device, cfg.max_eval_batches)
     if world_size > 1:
         val_loss = _reduce_mean(val_loss, is_tpu, device)
-    if is_tpu or is_master:
+    if (is_tpu or is_master) and end_step != last_saved:
         _save_checkpoint(run_info, model, optimizer, scheduler, end_step, ckpt_dir, is_tpu=is_tpu, is_master=is_master,
                          keep_last=getattr(cfg, "checkpoint_keep_last", 2))
 
@@ -1061,7 +1075,7 @@ def load_model(ckpt_path, device: torch.device, cfg: TrainConfig | None = None):
     return model
 
 
-def seed_checkpoint(src, dst_dir, name: str = "latest", parent: dict | None = None,
+def seed_checkpoint(src, dst_dir, parent: dict | None = None,
                     cfg: TrainConfig | None = None) -> checkpoint.Ref:
     """Write a fresh warm-start checkpoint from `src` (weights only, step 0, no optimizer).
 
@@ -1081,7 +1095,7 @@ def seed_checkpoint(src, dst_dir, name: str = "latest", parent: dict | None = No
         "data": None,
         "parent": parent or {"checkpoint": str(ref.weights), "step": src_state["step"]},
     }
-    return checkpoint.write(dst_dir, name, weights, alias_map, state, training=None)
+    return checkpoint.write(dst_dir, weights, alias_map, state, training=None, mark=("latest",))
 
 
 def _save_checkpoint(
@@ -1089,8 +1103,8 @@ def _save_checkpoint(
     keep_last: int = 2, is_tpu: bool = False, best: bool = False, best_val_loss: float | None = None,
     is_master: bool = True,
 ) -> None:
-    """Write `latest` (or `best`, weights only) in the safetensors format, and archive
-    `latest` as step_<N> when keep_last > 0.
+    """Write the checkpoint for `step` and point COMPLETE (or, with best=True, BEST) at it;
+    a best is weights only. After a latest, prune to the newest `keep_last` checkpoints.
 
     Every rank must call this on a multi-process TPU run: the device->host copy is per rank
     and the ranks meet at a rendezvous after the master has written.
@@ -1124,24 +1138,13 @@ def _save_checkpoint(
     # check in this file. (xm.is_master_ordinal() is a DIFFERENT api that defaults to the
     # *local* ordinal; when the two disagreed, half of a save's files were never written.)
     if is_master:
-        name = "best" if best else "latest"
-        ref = checkpoint.write(ckpt_dir, name, weights, alias_map, state, training)
-        # The old single-file checkpoint of the same name is now stale; leaving it would only
-        # confuse anything that still looks for it.
-        (ckpt_dir / f"{name}.pt").unlink(missing_ok=True)
+        ref = checkpoint.write(ckpt_dir, weights, alias_map, state, training,
+                               mark=("best",) if best else ("latest",))
         if not best:
-            if keep_last > 0:
-                for src in (ref.weights, ref.state, ref.optim):
-                    shutil.copyfile(src, ckpt_dir / src.name.replace("latest", f"step_{step}", 1))
             tqdm.write(f"Checkpoint saved: {ref.weights} (step {step})")
-            # Keep only the last N numbered archives, old .pt ones included. With keep_last=0
-            # nothing numbered is written, so this just sweeps archives of earlier sessions.
-            numbered = sorted({int(p.name.split(".")[0].split("_")[1])
-                               for p in ckpt_dir.glob("step_*.*")})
-            for old in (numbered[:-keep_last] if keep_last > 0 else numbered):
-                for p in ckpt_dir.glob(f"step_{old}.*"):
-                    p.unlink()
-                tqdm.write(f"Removed old checkpoint: step_{old}")
+            removed = checkpoint.prune(ckpt_dir, keep_last)
+            if removed:
+                tqdm.write(f"Removed old checkpoints: {', '.join(f'step_{r}' for r in removed)}")
     if is_tpu and _spmd_mesh is None:
         import torch_xla.runtime as xr
         if xr.world_size() > 1:

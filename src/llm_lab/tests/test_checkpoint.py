@@ -24,11 +24,11 @@ def _same_weights(a: dict, b: dict) -> bool:
 def test_training_writes_the_new_format(tiny_cfg, corpus):
     trainer.train(tiny_cfg)
     d = Path(tiny_cfg.checkpoint_dir)
-    for f in ("latest.safetensors", "latest.state.json", "latest.optim.pt", "tokenizer.json"):
+    for f in ("step_6.safetensors", "step_6.state.json", "step_6.optim.pt", "tokenizer.json"):
         assert (d / f).is_file(), f
-    assert not list(d.glob("*.pt")) or all(p.name.endswith(".optim.pt") for p in d.glob("*.pt"))
+    assert json.loads((d / "COMPLETE").read_text()) == {"step": 6, "checkpoint": "step_6"}
 
-    state = json.loads((d / "latest.state.json").read_text())
+    state = json.loads((d / "step_6.state.json").read_text())
     assert state["step"] == 6
     assert state["tokens_seen"] == 6 * tiny_cfg.batch_size * tiny_cfg.seq_len
     assert state["config"] == asdict(tiny_cfg)
@@ -36,9 +36,9 @@ def test_training_writes_the_new_format(tiny_cfg, corpus):
     assert state["data"]["files"]["train.bin"] > 0
     assert state["has_optimizer"] is True
     assert state["tied"] == {"lm_head.weight": "embedding.weight"}
-    # keep_last=1: one numbered archive, the last one.
-    assert sorted(p.name for p in d.glob("step_*")) == [
-        "step_6.optim.pt", "step_6.safetensors", "step_6.state.json"]
+    # keep_last=1: the latest, and the best (weights only) the evals found.
+    best = json.loads((d / "BEST").read_text())["step"]
+    assert set(checkpoint.steps_on_disk(d)) == {6, best}
 
 
 def test_load_model_needs_no_config(tiny_cfg):
@@ -48,14 +48,14 @@ def test_load_model_needs_no_config(tiny_cfg):
     assert state["step"] == 6
     assert model.lm_head.weight is model.embedding.weight  # tied again, as trained
     # Every way of naming the checkpoint finds the same one.
-    for p in (d, d / "latest.safetensors", d / "latest.state.json", d / "latest"):
-        assert checkpoint.locate(p) == checkpoint.Ref(d, "latest", legacy=False)
+    for p in (d, d / "step_6.safetensors", d / "step_6.state.json", d / "step_6"):
+        assert checkpoint.locate(p) == checkpoint.Ref(d, "step_6", legacy=False)
 
 
 def test_tied_weights_are_stored_once(tiny_cfg):
     trainer.train(tiny_cfg)
     from safetensors import safe_open
-    with safe_open(str(Path(tiny_cfg.checkpoint_dir) / "latest.safetensors"), "pt") as f:
+    with safe_open(str(checkpoint.find(tiny_cfg.checkpoint_dir).weights), "pt") as f:
         assert "lm_head.weight" not in f.keys() and "embedding.weight" in f.keys()
 
 
@@ -65,7 +65,7 @@ def test_untied_weights_build_an_untied_model(tiny_cfg, tmp_path):
     model = build_model(replace(tiny_cfg, tie_embeddings=False))
     weights = checkpoint.strip_prefixes(model.state_dict())
     state = {"step": 1, "config": asdict(tiny_cfg)}  # claims tied
-    checkpoint.write(tmp_path, "latest", weights, checkpoint.aliases(model), state, None)
+    checkpoint.write(tmp_path, weights, checkpoint.aliases(model), state, None)
     loaded, _ = checkpoint.load_model(tmp_path)
     assert loaded.lm_head.weight is not loaded.embedding.weight
     assert torch.equal(loaded.lm_head.weight, model.lm_head.weight)
@@ -88,7 +88,7 @@ def test_training_resumes_an_old_pt_and_replaces_it(tiny_cfg):
     result = trainer.train(tiny_cfg)  # max_steps 6: two more steps
     assert result["steps"] == 6
     assert not (d / "latest.pt").exists()
-    state = json.loads((d / "latest.state.json").read_text())
+    state = checkpoint.read_state(checkpoint.find(d))
     assert state["step"] == 6
     # The old checkpoint never counted tokens: estimated from this session's rate.
     assert state["tokens_seen"] == 6 * tiny_cfg.batch_size * tiny_cfg.seq_len
@@ -101,7 +101,7 @@ def test_resume_carries_tokens_and_parent(tiny_cfg):
     (d / "base.json").write_text(json.dumps({"dataset": "someone/base", "step": 123}))
     trainer.train(replace(tiny_cfg, max_steps=3))
     trainer.train(replace(tiny_cfg, max_steps=5, batch_size=2))
-    state = json.loads((d / "latest.state.json").read_text())
+    state = checkpoint.read_state(checkpoint.find(d))
     tok = tiny_cfg.seq_len
     assert state["tokens_seen"] == 3 * 4 * tok + 2 * 2 * tok
     assert state["parent"] == {"dataset": "someone/base", "step": 123}
@@ -138,5 +138,5 @@ def test_generate_cli_without_config(tiny_cfg):
 def test_bench_loader_without_config(tiny_cfg):
     from llm_lab.eval.benchmarks import load_checkpoint_model
     trainer.train(tiny_cfg)
-    model, step = load_checkpoint_model(None, Path(tiny_cfg.checkpoint_dir) / "latest.safetensors", "cpu")
+    model, step = load_checkpoint_model(None, Path(tiny_cfg.checkpoint_dir) / "step_6.safetensors", "cpu")
     assert step == 6 and not model.training

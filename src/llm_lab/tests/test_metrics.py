@@ -42,15 +42,14 @@ def test_training_writes_jsonl_not_into_the_checkpoint(tiny_cfg):
     log = metrics.read(d / metrics.FILE)
     assert _train_steps(log) == [1, 2, 3, 4, 5, 6]
     assert [e["step"] for e in log if "val_loss" in e] == [3, 6]
-    assert set(torch.load(d / "latest.optim.pt", weights_only=False)) == {"optimizer", "scheduler"}
+    assert set(torch.load(d / "step_6.optim.pt", weights_only=False)) == {"optimizer", "scheduler"}
 
 
 def test_rolled_back_checkpoint_resumes_without_abandoned_steps(tiny_cfg):
     cfg = replace(tiny_cfg, checkpoint_keep_last=2)
     trainer.train(cfg)  # checkpoints at 3 and 6
     d = Path(cfg.checkpoint_dir)
-    for f in d.glob("step_3.*"):  # roll latest back to step 3
-        shutil.copyfile(f, d / f.name.replace("step_3", "latest"))
+    checkpoint.set_marker(d, "latest", 3)  # roll latest back to step 3
     assert checkpoint.read_state(checkpoint.find(d))["step"] == 3
 
     result = trainer.train(replace(cfg, max_steps=5))

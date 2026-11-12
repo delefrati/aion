@@ -2,10 +2,15 @@
 seconds. Nothing here downloads anything or needs a GPU."""
 from __future__ import annotations
 
+import os
 import random
 from pathlib import Path
 
 import pytest
+
+# CPU only, here and in the subprocesses tests start: the results must not depend on whether
+# the machine has a GPU, and CI has none.
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 WORDS = ("the cat dog sat ran on a mat log and saw big small red blue green tree house "
          "river stone bird sings quietly loudly every morning night day sun moon star").split()

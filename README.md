@@ -83,7 +83,7 @@ python -m llm_lab.cli tokenizer --corpus data/prepared/corpus.txt \
 python -m llm_lab.cli train --config llm_lab/configs/mamba_small.yaml
 
 # 5. Evaluate a checkpoint (perplexity on the val set)
-python -m llm_lab.cli eval --checkpoint checkpoints/best.safetensors
+python -m llm_lab.cli eval --checkpoint checkpoints
 
 # 6. Generate text from a checkpoint
 python -m llm_lab.cli generate --checkpoint checkpoints \
@@ -93,18 +93,23 @@ python -m llm_lab.cli generate --checkpoint checkpoints \
 
 ### Checkpoint files
 
-A checkpoint called `latest` (or `best`, or `step_<N>`) is three files in the checkpoint
-directory:
+A checkpoint is three files named after its step, in the run's checkpoint directory:
 
 | File | Holds |
 |------|-------|
-| `latest.safetensors` | Model weights; tied embeddings are stored once |
-| `latest.state.json` | Step, tokens seen, the full training config, tokenizer hash, data id, parent run |
-| `latest.optim.pt` | Optimizer and scheduler state (absent for weights-only checkpoints such as `best`) |
+| `step_N.safetensors` | Model weights; tied embeddings are stored once |
+| `step_N.state.json` | Step, tokens seen, the full training config, tokenizer hash, data id, parent run |
+| `step_N.optim.pt` | Optimizer and scheduler state (absent for a weights-only best) |
 
-`--checkpoint` takes the directory (meaning its `latest`), any one of these files, or an old
-single-file `.pt` checkpoint. The old `.pt` files don't record their config, so they need
-`--config <training YAML>`; the new ones don't. `tokenizer.json` is read from beside the
+`COMPLETE` names the latest checkpoint and `BEST` the best one by val loss, each as
+`{"step": N, "checkpoint": "step_N"}`. A save writes each file to a temporary name and renames
+it into place, and moves the marker last, so a process killed mid-save leaves `COMPLETE` on
+the previous checkpoint. Metrics go to `metrics.jsonl` beside them, one JSON line per log or
+eval, appended to and never rewritten.
+
+`--checkpoint` takes the directory (meaning its latest), any one of a checkpoint's files, or
+an old single-file `.pt` checkpoint. The old `.pt` files don't record their config, so they
+need `--config <training YAML>`; the new ones don't. `tokenizer.json` is read from beside the
 checkpoint unless `--tokenizer` says otherwise.
 
 ### Chat fine-tuning
@@ -117,7 +122,7 @@ python -m llm_lab.cli merge-chat --raw-dir data/raw --out data/chat_merged.json
 
 # Instruction-tune a pretrained checkpoint (exports a serving bundle)
 python -m llm_lab.cli finetune --config llm_lab/configs/mamba_chat.yaml \
-    --pretrain checkpoints/best.safetensors --data data/chat_merged.json
+    --pretrain checkpoints --data data/chat_merged.json
 ```
 
 ### Commands

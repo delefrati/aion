@@ -51,7 +51,7 @@ def _run(name: str, overrides: dict, base: dict, seed: Path, work: Path, steps: 
     d = work / re.sub(r"[^\w.-]+", "_", name)
     shutil.rmtree(d, ignore_errors=True)
     d.mkdir(parents=True)
-    for f in seed.glob("latest.*"):
+    for f in seed.iterdir():  # a step_0 checkpoint and its COMPLETE marker
         shutil.copy2(f, d / f.name)
     batch = overrides.get("batch_size", base["batch_size"])
     cfg = {**base, **overrides,
