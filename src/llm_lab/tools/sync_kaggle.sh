@@ -29,6 +29,8 @@ BUILD=".build"
 # Push ALSO runs the kernel, so dry-run by default; -y/--yes actually pushes+runs.
 DO_PUSH=0
 FILTER=""
+PUSHED=()
+FAILED=()
 for a in "$@"; do
   case "$a" in
     -y|--yes) DO_PUSH=1 ;;
@@ -70,15 +72,31 @@ json.dump(m, open(p, "w"), indent=2)
 PY
   if [[ "$DO_PUSH" == 1 ]]; then
     echo "==> pushing (and RUNNING) $nb -> $slug"
-    kaggle kernels push -p "$d"
+    # The CLI exits 0 even when Kaggle refuses the push (e.g. "Maximum batch TPU session
+    # count of 1 reached"), so success is read from its output, not its exit code.
+    out="$(kaggle kernels push -p "$d" 2>&1)" || true
+    echo "$out" | grep -v "outdated \`kaggle\` version" || true
+    if grep -q "successfully pushed" <<<"$out"; then
+      PUSHED+=("$nb")
+    else
+      FAILED+=("$nb")
+    fi
   else
     echo "[dry-run] would push+run $nb -> $slug   (add -y to do it)"
   fi
 done < "$MAP"
 
 if [[ "$DO_PUSH" == 1 ]]; then
-  echo "Pushed. Each push QUEUED A RUN with the notebook's DEFAULT cell flags —"
-  echo "for a specific MODEL_SIZE/ADD_DATA run, use the Kaggle UI (Save & Run All)."
+  if (( ${#PUSHED[@]} )); then
+    echo "Pushed: ${PUSHED[*]}. Each push also QUEUED A RUN, which can't read Kaggle Secrets and"
+    echo "fails in Cell 1 (after waiting in the queue): stop it under View Active Events, and start"
+    echo "real runs from the UI (Save & Run All)."
+  fi
+  if (( ${#FAILED[@]} )); then
+    echo "NOT pushed (Kaggle refused; the live kernel is unchanged): ${FAILED[*]}"
+    exit 1
+  fi
+  (( ${#PUSHED[@]} )) || echo "Nothing pushed: no notebook matched."
 else
   echo "Dry-run only — nothing pushed. Re-run with -y to push+run."
 fi
