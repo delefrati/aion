@@ -30,6 +30,9 @@ What a session does:
    benchmarks (spec.bench) and push bench.json with it. A pretraining phase keeps no best
    checkpoint, so this is how it's judged. If the session dies first, the next one (which
    finds the budget spent) runs the bench instead.
+
+Every stage is timed (llm_lab.timing), the trainer's too: the session ends by printing where
+its time went, and copies the raw timings.jsonl to spec.output_dir.
 """
 from __future__ import annotations
 
@@ -45,6 +48,7 @@ from pathlib import Path
 
 import yaml
 
+from llm_lab import timing
 from llm_lab.storage import Store, StoreError
 from llm_lab.training import checkpoint, metrics
 
@@ -78,7 +82,8 @@ class SessionSpec:
     bench: tuple[str, ...] = ()        # tasks to score the final checkpoint on at the phase end
     bench_limit: int = 0               # questions per task; 0 = all
     bench_batch_size: int = 32
-    output_dir: Path | None = None     # also gets bench.json (Kaggle: /kaggle/working)
+    output_dir: Path | None = None     # also gets bench.json and timings.jsonl (Kaggle: /kaggle/working)
+    started_at: float | None = None    # time.time() the notebook started: its setup gets timed too
     python: str = sys.executable
 
     @property
@@ -88,6 +93,10 @@ class SessionSpec:
     @property
     def data_dir(self) -> Path:
         return Path(self.work_dir) / "data"
+
+    @property
+    def timings_file(self) -> Path:
+        return Path(self.work_dir) / "timings.jsonl"
 
 
 @dataclass
@@ -297,8 +306,11 @@ class Banker:
             if step is None or (not force and self.pushed is not None and step <= self.pushed):
                 return True
             print(f"[bank] {why}: pushing step {step:,} to {self.spec.store}...", flush=True)
+            files = sorted(self.stage.iterdir())
+            size_gb = round(sum(f.stat().st_size for f in files) / 1e9, 2)
             try:
-                self.spec.store.push(sorted(self.stage.iterdir()), f"step {step}")
+                with timing.stage("push", step=step, gb=size_gb, why=why):
+                    self.spec.store.push(files, f"step {step}")
             except StoreError as e:
                 self.fail_streak += 1
                 self.retry_after = time.time() + min(600 * self.fail_streak, 1800)
@@ -387,7 +399,8 @@ def run_bench(spec: SessionSpec) -> dict:
 
 
 def _bench_and_push(spec: SessionSpec, banker: "Banker") -> None:
-    run_bench(spec)
+    with timing.stage("bench"):
+        run_bench(spec)
     if spec.push and not banker.bank("bench results", force=True):
         raise PushError(f"bench.json for step {banker.pushed} couldn't be pushed to {spec.store}.")
 
@@ -399,7 +412,8 @@ def train(spec: SessionSpec, cfg: dict, on_line=None) -> int:
     run_yaml = spec.ckpt_dir / "run.yaml"
     run_yaml.write_text(yaml.dump(cfg))
     src_root = Path(__file__).resolve().parent.parent
-    env = {**os.environ, "PYTHONPATH": str(src_root) + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    env = {**os.environ, "PYTHONPATH": str(src_root) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+           timing.ENV: str(spec.timings_file)}
     proc = subprocess.Popen([spec.python, "-u", "-m", "llm_lab.cli", "train", "--config", str(run_yaml)],
                             cwd=src_root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1)
@@ -425,7 +439,36 @@ def train(spec: SessionSpec, cfg: dict, on_line=None) -> int:
 def run_session(spec: SessionSpec, on_line=None) -> SessionResult:
     """Restore, train, bank and push one session. See the module docstring."""
     Path(spec.work_dir).mkdir(parents=True, exist_ok=True)
-    start, existed = _restore(spec)
+    spec.timings_file.unlink(missing_ok=True)
+    previous = os.environ.get(timing.ENV)
+    os.environ[timing.ENV] = str(spec.timings_file)  # this process's stages (the banker's too)
+    try:
+        if spec.started_at is not None:
+            timing.record("setup", time.time() - spec.started_at)
+        return _run_session(spec, on_line)
+    finally:
+        if previous is None:
+            os.environ.pop(timing.ENV, None)
+        else:
+            os.environ[timing.ENV] = previous
+        _report_timings(spec)
+
+
+def _report_timings(spec: SessionSpec) -> None:
+    """Print where the session's time went; keep the raw lines in output_dir. Never raises."""
+    try:
+        events = timing.read(spec.timings_file)
+        print(f"\n{spec.name}: where this session's time went\n{timing.summary(events)}", flush=True)
+        if spec.output_dir is not None and spec.timings_file.exists():
+            Path(spec.output_dir).mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(spec.timings_file, Path(spec.output_dir) / spec.timings_file.name)
+    except Exception as e:  # timings must never take the session down
+        print(f"timings: couldn't report ({e})")
+
+
+def _run_session(spec: SessionSpec, on_line=None) -> SessionResult:
+    with timing.stage("restore"):
+        start, existed = _restore(spec)
     # A seeded run's step 0 isn't in the store yet; a resumed run's start step is.
     pushed = start if existed else None
     cfg = session_config(spec, start)
@@ -434,7 +477,8 @@ def run_session(spec: SessionSpec, on_line=None) -> SessionResult:
         if spec.bench and spec.push and not _bench_done(spec, start):
             _bench_and_push(spec, Banker(spec, pushed))  # the session that finished died first
         return SessionResult(start, start, pushed, 0, True)
-    fetch_data(spec)
+    with timing.stage("data"):
+        fetch_data(spec)
     print(f"{spec.name}: training steps {start:,} -> {cfg['max_steps']:,} of {spec.target_steps:,}"
           + (f", for at most {cfg['max_train_minutes']:.0f} min" if spec.deadline else "")
           + ("" if spec.push else " (smoke test: nothing will be pushed)"), flush=True)
@@ -446,7 +490,8 @@ def run_session(spec: SessionSpec, on_line=None) -> SessionResult:
         watcher.start()
     rc = 1
     try:
-        rc = train(spec, cfg, on_line)
+        with timing.stage("train", start_step=start):
+            rc = train(spec, cfg, on_line)
     finally:
         stop.set()
         if watcher.is_alive():

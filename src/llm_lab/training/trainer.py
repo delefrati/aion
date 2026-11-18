@@ -1,6 +1,10 @@
 """Training loop with checkpoint/resume, grad clipping, and eval."""
 from __future__ import annotations
 
+import time
+
+_IMPORT_T0 = time.time()  # trainer_setup in the session timings counts from here
+
 import contextlib
 import json
 import math
@@ -9,7 +13,6 @@ import shutil
 import signal
 import sys
 import threading
-import time
 from pathlib import Path
 
 import torch
@@ -35,6 +38,7 @@ def _handle_save_signal(signum, frame):
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from llm_lab import timing
 from llm_lab.data.dataset import TextDataset
 from llm_lab.data.instruction import InstructionDataset, MultiTurnDataset, collate_instruction
 from llm_lab.tokenizer.bpe import load_tokenizer
@@ -697,6 +701,8 @@ def train(cfg: TrainConfig) -> dict:
     if resumed_extras.get("scaler") is not None and use_amp:
         scaler.load_state_dict(resumed_extras["scaler"])
     t0 = time.time()
+    if is_master:
+        timing.record("trainer_setup", t0 - _IMPORT_T0)
     effective_batch = cfg.schedule.batch_size * accum_steps * world_size
     if accum_steps > 1 and is_master:
         tqdm.write(f"Gradient accumulation: {accum_steps} steps (effective batch={effective_batch})")
@@ -791,6 +797,9 @@ def train(cfg: TrainConfig) -> dict:
             done = step + 1
             if use_fsdp and step == start_step:
                 _shard_optimizer_state(optimizer, is_master)  # fresh moments exist only now
+            if step == start_step and is_master:
+                loss.item()  # one host sync: the first step (and its XLA compile) has run
+                timing.record("first_step", time.time() - t0, step=step + 1)
 
             # Re-scale loss for logging (undo the /accum_steps)
             loss = loss * accum_steps
@@ -818,6 +827,7 @@ def train(cfg: TrainConfig) -> dict:
 
             # eval — every core evaluates its shard, then we average across cores
             if (step + 1) % cfg.schedule.eval_every == 0:
+                t_eval = time.time()
                 val_loss = evaluate(model, val_loader, device, cfg.schedule.max_eval_batches)
                 if world_size > 1:
                     val_loss = _reduce_mean(val_loss, is_tpu, device)
@@ -833,6 +843,7 @@ def train(cfg: TrainConfig) -> dict:
                     note = f" | val_old_loss {val_old:.4f}"
                 _record(entry)
                 if is_master:
+                    timing.record("eval", time.time() - t_eval, step=step + 1)
                     tqdm.write(f"step {step + 1:>5d} | val_loss {val_loss:.4f}{note}")
                 min_delta = cfg.schedule.early_stop_min_delta
                 # best.pt: overwrite on ANY all-time improvement. min_delta is an
@@ -1121,6 +1132,7 @@ def _save_checkpoint(
     Every rank must call this on a multi-process TPU run: the device->host copy is per rank
     and the ranks meet at a rendezvous after the master has written.
     """
+    t_save = time.time()
     target = model.module if hasattr(model, "module") else model
     alias_map = checkpoint.aliases(target)
     weights = _cpu(_strip_prefixes(target.state_dict()), is_tpu)
@@ -1157,8 +1169,9 @@ def _save_checkpoint(
     if is_master:
         ref = checkpoint.write(ckpt_dir, weights, alias_map, state, training,
                                mark=("best",) if best else ("latest",))
+        timing.record("save", time.time() - t_save, step=step, best=best)
         if not best:
-            tqdm.write(f"Checkpoint saved: {ref.weights} (step {step})")
+            tqdm.write(f"Checkpoint saved: {ref.weights} (step {step}, {time.time() - t_save:.1f}s)")
             removed = checkpoint.prune(ckpt_dir, keep_last)
             if removed:
                 tqdm.write(f"Removed old checkpoints: {', '.join(f'step_{r}' for r in removed)}")
