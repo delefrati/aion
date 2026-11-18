@@ -1,0 +1,46 @@
+# What each notebook runs (AION-3). The notebook reads this after cloning the repo, so
+# changing the active run is a commit here, and a UI "Save & Run All" and an API push run
+# the same thing. Load it with llm_lab.runs.active("<notebook>").
+#
+# Notebook settings:
+#   phase           a key of `phases` below
+#   mode            train | smoke (smoke_steps steps, pushes nothing) | sweep (throughput
+#                   sweep from the phase's checkpoint; trains and pushes nothing)
+#   start           auto: resume the phase's Dataset if it exists, else seed it from the
+#                   parent (after checking the parent is readable). true / false force it.
+#   session_hours   a timed phase trains until this long after Cell 1 started (Kaggle: 9h)
+#   session_reserve_min  ...keeping this much for the final eval, save and push
+#   steps_per_session    an untimed phase's steps per session
+#   tpu_spmd        false: the single-core launch (transformer_tpu_large.yaml's batch)
+#
+# Phases: ckpt is the phase's checkpoint Dataset, parent what its first session seeds from,
+# data the tokenized cache, budget a run_config.BUDGETS name, config a file in configs/.
+
+notebooks:
+  kaggle_pretrain_tpu:
+    phase: edu2
+    mode: train
+    start: auto
+    smoke_steps: 300
+    session_hours: 8.5
+    session_reserve_min: 20
+    steps_per_session: 5000
+    tpu_spmd: true
+
+phases:
+  edu:  # done, 20k steps
+    budget: pretrain_large_edu
+    ckpt: aion-transformer-edu-large
+    parent: aion-transformer-tpu-large
+    data: aion-pretrain-edu-tokenized
+    config: transformer_tpu_large_edu_spmd.yaml
+    timed: false
+    title: AION Transformer TPU Large Checkpoints Edu
+  edu2:
+    budget: pretrain_large_edu2
+    ckpt: aion-transformer-edu2-large
+    parent: aion-transformer-edu-large
+    data: aion-pretrain-edu-xl-tokenized
+    config: transformer_tpu_large_edu2_spmd.yaml
+    timed: true
+    title: AION Transformer Edu2 Large Checkpoints

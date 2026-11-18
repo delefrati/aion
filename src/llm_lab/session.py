@@ -12,8 +12,11 @@ no-op re-pushes of restored files. This is the one implementation, with tests.
 What a session does:
 1. Restore the run's store into work_dir/checkpoints. The run must already exist unless
    spec.start says this session may start it (seeded from spec.parent, or from scratch).
-   Fails closed: a store without a checkpoint, or a missing store the spec didn't say to
-   start, stops the session before anything trains or pushes.
+   start="auto" decides from the stores: resume if the run's store exists, else seed it
+   from the parent, once the parent is readable with the same credential and a second
+   lookup still finds the run missing. Fails closed: a store without a checkpoint, or a
+   missing store the spec didn't say to start, stops the session before anything trains
+   or pushes.
 2. Restore the tokenized data (spec.data) into work_dir/data.
 3. Train in a subprocess (`python -m llm_lab.cli train`), so every launch path the CLI knows
    (CPU, CUDA DDP, TPU SPMD) works the same way.
@@ -62,7 +65,7 @@ class SessionSpec:
     target_steps: int                  # the run's budget: no session trains past it
     work_dir: Path                     # local: checkpoints/, data/, run.yaml
     parent: Store | None = None        # the run's first session seeds from its latest checkpoint
-    start: bool = False                # this session may start the run (the store is missing)
+    start: bool | str = False          # may start the run: True, False, or "auto" (see restore)
     data: Store | None = None          # tokenized cache: train.bin, val.bin, tokenizer.json
     steps: int | None = None           # steps this session; None trains to target_steps
     deadline: float | None = None      # time.time() by which training must stop (timed session)
@@ -104,18 +107,31 @@ def _latest_step(ckpt_dir: Path) -> int | None:
 
 
 def restore(spec: SessionSpec) -> int:
-    """Put the run's latest checkpoint in spec.ckpt_dir; return its step.
+    """Put the run's latest checkpoint in spec.ckpt_dir; return its step."""
+    return _restore(spec)[0]
+
+
+def _restore(spec: SessionSpec) -> tuple[int, bool]:
+    """restore(), and whether the run's store existed (False: this session starts the run).
 
     The store's files replace whatever the directory held. A missing store is a new run
     only when spec.start says so; then the parent's latest weights become step 0 (or, with
-    no parent, training starts from random init)."""
+    no parent, training starts from random init).
+
+    start="auto" resumes a store that exists and seeds one that doesn't, but only from a
+    parent: a random-init start must be asked for (start=True). Before seeding it checks
+    that "missing" is a real answer and not a failed lookup: the parent must list with the
+    same credential (a credential without access also answers 403), and a second listing
+    of the run's store must still find it missing."""
+    if spec.start not in (True, False, "auto"):
+        raise ValueError(f"start must be True, False or 'auto', not {spec.start!r}")
     d = spec.ckpt_dir
     if d.exists():
         shutil.rmtree(d)
     d.mkdir(parents=True)
     files = spec.store.files()
     if files is not None:
-        if spec.start:
+        if spec.start is True:
             raise SessionError(f"{spec.store} already exists, but this session was told to start "
                                f"{spec.name}. Resume it instead (start=False); starting over "
                                f"would push step 0 over its progress.")
@@ -125,16 +141,33 @@ def restore(spec: SessionSpec) -> int:
             raise SessionError(f"{spec.store} exists but holds no checkpoint "
                                f"(files: {sorted(files)}). Refusing to train from scratch over it.")
         print(f"{spec.name}: resuming from step {step:,} ({spec.store}).")
-        return step
-    if not spec.start:
+        return step, True
+    if spec.start is False:
         raise SessionError(f"{spec.store} not found. If this is {spec.name}'s first session, "
                            f"start it explicitly (start=True); a lookup that wrongly reports "
                            f"'missing' must never seed a run over its real progress.")
+    if spec.start == "auto":
+        _confirm_missing(spec)
     if spec.parent is None:
         print(f"{spec.name}: new run, training from random init.")
-        return 0
+        return 0, False
     _seed_from_parent(spec)
-    return 0
+    return 0, False
+
+
+def _confirm_missing(spec: SessionSpec) -> None:
+    """start="auto" found no store: make sure that's the answer before seeding over it."""
+    if spec.parent is None:
+        raise SessionError(f"{spec.store} not found and {spec.name} has no parent. A run from "
+                           f"random init must be started explicitly (start=True).")
+    if spec.parent.files() is None:
+        raise SessionError(f"{spec.store} not found, and neither is its parent {spec.parent}. "
+                           f"Not starting {spec.name}: the credential may not see either.")
+    if spec.store.files() is not None:
+        raise SessionError(f"{spec.store} was missing, then found on a second look. Not seeding "
+                           f"over it; run the session again to resume it.")
+    print(f"{spec.name}: {spec.store} not found (twice) and its parent {spec.parent} is readable: "
+          f"this is {spec.name}'s first session.")
 
 
 def _seed_from_parent(spec: SessionSpec) -> None:
@@ -392,9 +425,9 @@ def train(spec: SessionSpec, cfg: dict, on_line=None) -> int:
 def run_session(spec: SessionSpec, on_line=None) -> SessionResult:
     """Restore, train, bank and push one session. See the module docstring."""
     Path(spec.work_dir).mkdir(parents=True, exist_ok=True)
-    start = restore(spec)
+    start, existed = _restore(spec)
     # A seeded run's step 0 isn't in the store yet; a resumed run's start step is.
-    pushed = None if spec.start else start
+    pushed = start if existed else None
     cfg = session_config(spec, start)
     if cfg is None:
         print(f"{spec.name}: budget reached ({start:,}/{spec.target_steps:,} steps): nothing to train.")

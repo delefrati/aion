@@ -84,6 +84,64 @@ def test_seeding_from_a_parent(spec_for, tiny_cfg, tmp_path):
     assert state["parent"]["store"] == str(parent)
 
 
+class FlakyStore(RecordingStore):
+    """Answers "missing" for its first `missing` listings, then lists what it holds."""
+
+    def __init__(self, path, missing: int):
+        super().__init__(path)
+        self.missing = missing
+
+    def files(self):
+        if self.missing:
+            self.missing -= 1
+            return None
+        return super().files()
+
+
+def test_auto_start_seeds_a_new_phase_then_resumes_it(spec_for, tmp_path):
+    parent = RecordingStore(tmp_path / "parent")
+    run_session(spec_for(parent, start=True, work_dir=tmp_path / "pw"))  # parent at step 6
+    child = RecordingStore(tmp_path / "child")
+    spec = spec_for(child, start="auto", parent=parent, steps=3, target_steps=6)
+    r = run_session(spec)  # the phase's first session: seeds
+    assert (r.start_step, r.end_step, r.pushed_step) == (0, 3, 3)
+    assert checkpoint.read_state(checkpoint.find(child.path))["parent"]["step"] == 6
+    r = run_session(spec)  # the same spec again: resumes, no flag to reset
+    assert (r.start_step, r.end_step, r.phase_done) == (3, 6, True)
+    assert child.pushes == [3, 6]
+
+
+def test_auto_start_never_starts_from_random_init(spec_for, tmp_path):
+    store = RecordingStore(tmp_path / "store")
+    with pytest.raises(SessionError, match="no parent"):
+        run_session(spec_for(store, start="auto"))
+    assert store.files() is None
+
+
+def test_auto_start_needs_a_readable_parent(spec_for, tmp_path):
+    """A credential that sees nothing answers "missing" for both: that's no reason to seed."""
+    store = RecordingStore(tmp_path / "store")
+    with pytest.raises(SessionError, match="neither is its parent"):
+        run_session(spec_for(store, start="auto", parent=LocalStore(tmp_path / "nothing")))
+    assert store.files() is None
+
+
+def test_auto_start_does_not_seed_a_run_found_on_a_second_look(spec_for, tmp_path):
+    parent = RecordingStore(tmp_path / "parent")
+    run_session(spec_for(parent, start=True, work_dir=tmp_path / "pw"))
+    real = RecordingStore(tmp_path / "child")
+    run_session(spec_for(real, start=True, steps=3))  # the run holds step 3
+    flaky = FlakyStore(tmp_path / "child", missing=1)  # one lookup wrongly says "missing"
+    with pytest.raises(SessionError, match="second look"):
+        run_session(spec_for(flaky, start="auto", parent=parent))
+    assert real.step() == 3 and flaky.pushes == []
+
+
+def test_start_must_be_true_false_or_auto(spec_for, tmp_path):
+    with pytest.raises(ValueError, match="auto"):
+        run_session(spec_for(RecordingStore(tmp_path / "store"), start="yes"))
+
+
 def test_seeding_from_an_old_pt_parent(spec_for, tiny_cfg, tmp_path):
     from llm_lab.tests.helpers import legacy_checkpoint
     parent = LocalStore(tmp_path / "old_parent")
@@ -192,10 +250,11 @@ def test_background_banking_pushes_while_training(spec_for, tmp_path, monkeypatc
     assert len(store.pushes) >= 3 and store.pushes == sorted(set(store.pushes))
 
 
-def test_kaggle_sessions_like_the_tpu_notebook(fake_kaggle, tiny_cfg, corpus, tmp_path):
+@pytest.mark.parametrize("first, later", [(True, False), ("auto", "auto")])
+def test_kaggle_sessions_like_the_tpu_notebook(fake_kaggle, tiny_cfg, corpus, tmp_path, first, later):
     """The notebook's flow against the fake kaggle CLI: data from a Dataset, the first
     session seeds from an old-format parent Dataset and creates the run's Dataset, the
-    second resumes from it."""
+    second resumes from it. With start="auto" both sessions are the same spec."""
     from llm_lab.data.dataset import TextDataset
     from llm_lab.storage import KaggleStore
     from llm_lab.tests.helpers import legacy_checkpoint
@@ -221,14 +280,14 @@ def test_kaggle_sessions_like_the_tpu_notebook(fake_kaggle, tiny_cfg, corpus, tm
                            data=kaggle("data"), config=cfg, target_steps=6, steps=3,
                            work_dir=tmp_path / "run", bank_every=3600, **kw)
 
-    r = run_session(spec(start=True))
+    r = run_session(spec(start=first))
     assert (r.start_step, r.end_step, r.pushed_step) == (0, 3, 3)
     pushed = fake_kaggle.dataset("me/phase2")
     state = json.loads((pushed / "step_3.state.json").read_text())
     assert state["parent"]["step"] == 20000 and state["data"]["id"] == "kaggle:me/data"
     assert state["config"]["data"]["train_path"].endswith("train.txt")
 
-    r = run_session(spec())
+    r = run_session(spec(start=later))
     assert (r.start_step, r.end_step, r.phase_done) == (3, 6, True)
     assert json.loads((pushed / "COMPLETE").read_text())["step"] == 6
     assert not any(c["token"] for c in fake_kaggle.calls())
