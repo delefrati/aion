@@ -61,13 +61,23 @@ while read -r nb name _; do
   # Pull live metadata so we keep the UI-set accelerator + dataset sources.
   kaggle kernels pull "$slug" -p "$d" -m >/dev/null
   cp "$NB_DIR/$nb" "$d/"
-  python3 - "$d/kernel-metadata.json" "$nb" <<'PY'
+  python3 - "$d/kernel-metadata.json" "$nb" "$OWNER" "$NB_DIR/runs.yaml" <<'PY'
 import json, sys
-p, nb = sys.argv[1], sys.argv[2]
+p, nb, owner, runs = sys.argv[1:5]
 m = json.load(open(p))
 m["code_file"] = nb
 m["language"] = "python"
 m["kernel_type"] = "notebook"
+# Attach the active phase's tokenized data (runs.yaml) as an input, so the session links it
+# instead of downloading it. Inputs attached in the UI are kept.
+import yaml
+r = yaml.safe_load(open(runs))
+run = (r.get("notebooks") or {}).get(nb[:-len(".ipynb")])
+if run:
+    src = f"{owner}/{r['phases'][run['phase']]['data']}"
+    if src not in m.setdefault("dataset_sources", []):
+        m["dataset_sources"].append(src)
+        print(f"    attaching input {src} (runs.yaml: phase {run['phase']})")
 json.dump(m, open(p, "w"), indent=2)
 PY
   if [[ "$DO_PUSH" == 1 ]]; then

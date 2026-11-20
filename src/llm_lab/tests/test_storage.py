@@ -144,3 +144,48 @@ def test_kaggle_io_download_dataset_still_works(fake_kaggle, tmp_path):
     assert download_dataset("someone/run", tmp_path / "d", wait=0) is None
     KaggleStore("someone/run", wait=0).push(_files(tmp_path / "src", latest__pt="w"), "x")
     assert download_dataset("someone/run", tmp_path / "d", wait=0) == ["latest.pt"]
+
+
+def _attached(fake_kaggle, tmp_path, layout="flat"):
+    """A Dataset me/data in the fake Kaggle, and a copy of it as an attached input."""
+    from llm_lab.storage import KaggleStore
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "train.bin").write_bytes(b"x" * 100)
+    (src / "val.bin").write_bytes(b"y" * 10)
+    KaggleStore("me/data", wait=0, push_wait=0).push(sorted(src.iterdir()))
+    root = tmp_path / "input"
+    mount = root / "data" if layout == "flat" else root / "datasets" / "me" / "data"
+    mount.mkdir(parents=True)
+    for f in src.iterdir():
+        (mount / f.name).write_bytes(f.read_bytes())
+    return root, mount
+
+
+@pytest.mark.parametrize("layout", ["flat", "nested"])
+def test_kaggle_links_an_attached_input_instead_of_downloading(fake_kaggle, tmp_path, layout):
+    from llm_lab.storage import KaggleStore
+    root, mount = _attached(fake_kaggle, tmp_path, layout)
+    store = KaggleStore("me/data", wait=0, use_mounted=True, mount_roots=[root])
+    assert sorted(store.download(tmp_path / "dest")) == ["train.bin", "val.bin"]
+    assert (tmp_path / "dest" / "train.bin").resolve() == (mount / "train.bin").resolve()
+    assert not [c for c in fake_kaggle.calls() if "download" in c["argv"]]
+
+
+def test_kaggle_downloads_what_the_attached_input_lacks_or_differs_in(fake_kaggle, tmp_path):
+    from llm_lab.storage import KaggleStore
+    root, mount = _attached(fake_kaggle, tmp_path)
+    (mount / "val.bin").write_bytes(b"y" * 9)  # an older version: the size differs
+    (mount / "train.bin").unlink()
+    store = KaggleStore("me/data", wait=0, use_mounted=True, mount_roots=[root])
+    store.download(tmp_path / "dest")
+    dest = tmp_path / "dest"
+    assert not (dest / "val.bin").is_symlink() and (dest / "val.bin").stat().st_size == 10
+    assert not (dest / "train.bin").is_symlink() and (dest / "train.bin").stat().st_size == 100
+
+
+def test_kaggle_ignores_attached_inputs_unless_asked(fake_kaggle, tmp_path):
+    from llm_lab.storage import KaggleStore
+    root, _ = _attached(fake_kaggle, tmp_path)
+    KaggleStore("me/data", wait=0, mount_roots=[root]).download(tmp_path / "dest")
+    assert not (tmp_path / "dest" / "train.bin").is_symlink()

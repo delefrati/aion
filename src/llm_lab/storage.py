@@ -140,14 +140,25 @@ class KaggleStore(Store):
     The listing answers 403 (not 404) for a Dataset that doesn't exist, so a 403 means
     missing. A credential without access gets a 403 too; the listing output is printed so
     that case can be told apart. A 401 is a bad credential and raises.
+
+    With use_mounted, a file the notebook already has as an attached input (under
+    /kaggle/input) is linked instead of downloaded, when its size matches the listing; any
+    other file is downloaded as usual. Only for a store that is never pushed back from
+    `dest`, such as the tokenized data: an attached input is pinned to the version it was
+    attached at and is read-only. Checkpoint stores change every session and stay downloads.
     """
 
     NOTEBOOK_TOKENS = ("KAGGLE_API_V1_TOKEN", "KAGGLE_API_TOKEN")
     MISSING = ("403", "404", "not found", "doesn't exist", "does not exist")
 
+    MOUNT_ROOTS = ("/kaggle/input",)
+
     def __init__(self, slug: str, title: str | None = None, attempts: int = 6, wait: float = 20,
-                 push_attempts: int = 3, push_wait: float = 30, cli: str = "kaggle"):
+                 push_attempts: int = 3, push_wait: float = 30, cli: str = "kaggle",
+                 use_mounted: bool = False, mount_roots: Iterable = MOUNT_ROOTS):
         self.slug = slug
+        self.use_mounted = use_mounted
+        self.mount_roots = [Path(r) for r in mount_roots]
         self.name = f"kaggle:{slug}"
         self.title = title or slug.split("/")[-1]
         self.attempts, self.wait = attempts, wait
@@ -207,6 +218,14 @@ class KaggleStore(Store):
         restored = []
         for name, size in files.items():
             path, out, rc = dest / name, "", 0
+            mounted = self._mounted(name, size) if self.use_mounted else None
+            if mounted is not None:
+                if path.exists() or path.is_symlink():
+                    path.unlink()
+                path.symlink_to(mounted)
+                restored.append(name)
+                print(f"  {name} ({size / 1e6:,.1f} MB): attached input {mounted}, not downloaded")
+                continue
             for attempt in range(1, self.attempts + 1):
                 # --force: the CLI otherwise skips a file whose local copy looks newer.
                 rc, out = self._run("datasets", "download", "-d", self.slug, "-f", name,
@@ -221,6 +240,23 @@ class KaggleStore(Store):
             else:
                 raise StoreError(f"Could not download {name} from {self.slug}.\nLast output:\n{out}")
         return restored
+
+    def _mounted(self, name: str, size: int) -> Path | None:
+        """The attached input's copy of `name`, if there is one of the listed size.
+
+        Kaggle has mounted inputs at /kaggle/input/<dataset> and, in newer images, deeper
+        (e.g. /kaggle/input/datasets/<owner>/<dataset>), so both are looked for."""
+        owner, ds = self.slug.split("/", 1)
+        for root in self.mount_roots:
+            for d in (root / ds, root / "datasets" / owner / ds, *root.glob(f"*/{ds}"),
+                      *root.glob(f"*/*/{ds}")):
+                f = d / name
+                try:
+                    if f.is_file() and f.stat().st_size == size:
+                        return f
+                except OSError:
+                    continue
+        return None
 
     def push(self, paths, message=""):
         """One new Dataset version holding exactly `paths` (created on the first push).
