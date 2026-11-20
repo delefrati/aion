@@ -119,3 +119,22 @@ def test_step_batch_sampler_is_a_function_of_seed_and_batch():
     perm = StepBatchSampler(10, 5, seed=1, replacement=False)
     e0, e1 = perm.batch(0) + perm.batch(1), perm.batch(2) + perm.batch(3)
     assert sorted(e0) == sorted(e1) == list(range(10)) and e0 != e1
+
+
+@pytest.mark.parametrize("capturable", [False, True])
+def test_restored_optimizer_keeps_step_where_a_fresh_one_does(capturable):
+    """AION-27: moving a restored AdamW's `step` onto an XLA device made every optimizer
+    step call .item() there, ~30% of a TPU session's throughput. The moments move; `step`
+    stays on the CPU unless the optimizer is capturable."""
+    from llm_lab.training.trainer import _optimizer_state_to
+    p = torch.nn.Parameter(torch.zeros(4))
+    opt = torch.optim.AdamW([p])
+    p.grad = torch.ones(4)
+    opt.step()
+    restored = torch.optim.AdamW([p])
+    restored.load_state_dict(opt.state_dict())
+    restored.param_groups[0]["capturable"] = capturable  # CPU AdamW refuses capturable=True
+    _optimizer_state_to(restored, torch.device("meta"))  # any device other than the CPU
+    state = restored.state[p]
+    assert state["exp_avg"].device.type == "meta" and state["exp_avg_sq"].device.type == "meta"
+    assert state["step"].device.type == ("meta" if capturable else "cpu")

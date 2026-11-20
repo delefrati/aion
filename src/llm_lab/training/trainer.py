@@ -394,6 +394,25 @@ def _make_scheduler(cfg: TrainConfig, optimizer):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def _optimizer_state_to(optimizer, device) -> None:
+    """Move restored optimizer state onto the training device, the way a fresh one is laid out.
+
+    The moments go to the device. Adam's scalar `step` stays where PyTorch keeps it, on the
+    CPU, unless the param group is capturable or fused: the non-capturable AdamW reads it
+    with .item() every optimizer step, and on an XLA device each .item() stops the step to
+    fetch the value. That cost a resumed TPU session ~30% throughput (AION-27: edu2's
+    resumed session ran at 166k tok/s against 238k for the one seeded with fresh moments).
+    """
+    for group in optimizer.param_groups:
+        on_device_step = bool(group.get("capturable") or group.get("fused"))
+        for p in group["params"]:
+            opt_state = optimizer.state.get(p, {})
+            for k, v in opt_state.items():
+                if not isinstance(v, torch.Tensor) or (k == "step" and not on_device_step):
+                    continue
+                opt_state[k] = v.to(device)
+
+
 def _resume_if_available(cfg: TrainConfig, model, optimizer, scheduler, ckpt_dir: Path,
                          device: torch.device, is_master: bool) -> tuple[int, dict, list[dict], dict]:
     """Resume from the latest checkpoint if there is one (new format, else an old latest.pt).
@@ -423,11 +442,7 @@ def _resume_if_available(cfg: TrainConfig, model, optimizer, scheduler, ckpt_dir
             if is_master:
                 tqdm.write(f"WARNING: optimizer state not restored ({e}); starting with fresh moments.")
         else:
-            # Optimizer state loaded on CPU; move it onto the training device.
-            for opt_state in optimizer.state.values():
-                for k, v in opt_state.items():
-                    if isinstance(v, torch.Tensor):
-                        opt_state[k] = v.to(device)
+            _optimizer_state_to(optimizer, device)
     if training["scheduler"] is not None and not reset_opt:
         scheduler.load_state_dict(training["scheduler"])
     step = state["step"]
